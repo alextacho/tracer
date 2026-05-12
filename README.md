@@ -15,21 +15,7 @@ Recommended install from GitHub:
 ```bash
 pipx install "git+https://github.com/alextacho/tracer.git"
 ```
-
-For a specific branch or tag:
-
-```bash
-pipx install "git+https://github.com/alextacho/tracer.git@main"
-pipx install "git+https://github.com/alextacho/tracer.git@v0.1.0"
-```
-
-For a private repo over SSH:
-
-```bash
-pipx install "git+ssh://git@github.com/alextacho/tracer.git@main"
-```
-
-Plain `pip` also works, though `pipx` is better for CLI tools:
+or
 
 ```bash
 pip install "git+https://github.com/alextacho/tracer.git"
@@ -40,60 +26,6 @@ After installation:
 ```bash
 tracer --help
 ```
-
-For local development, clone or copy this repository, then run Tracer from the repository directory:
-
-```bash
-./tracer --help
-```
-
-Optional shell install from the repository directory:
-
-```bash
-mkdir -p ~/.local/bin
-ln -s "$PWD/tracer" ~/.local/bin/tracer
-```
-
-After that, make sure `~/.local/bin` is on your `PATH`.
-
-Alternatively, keep Tracer unlinked and run commands as `./tracer ...` from the repository.
-
-## Distribute
-
-Tracer is packaged as a Python CLI. You can distribute it without publishing to PyPI by installing directly from GitHub:
-
-```bash
-pipx install "git+https://github.com/alextacho/tracer.git@main"
-```
-
-To distribute a stable release, create a git tag and install that tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-pipx install "git+https://github.com/alextacho/tracer.git@v0.1.0"
-```
-
-Users can upgrade with:
-
-```bash
-pipx upgrade claude-code-tracer
-```
-
-The installed command is:
-
-```bash
-tracer
-```
-
-Recommended team flow:
-
-1. Put this repository in git.
-2. Tag releases.
-3. Ask users to install with `pipx install "git+https://github.com/alextacho/tracer.git@<tag>"`.
-4. Ask each user to run `tracer mcp install --scope user` or `tracer mcp install --scope local` on their machine.
-
-Do not commit a user-specific MCP registration that points at one person's checkout path. MCP stdio commands are executed locally, so the path must exist on the machine running Claude Code.
 
 If every user installs `tracer` on `PATH`, a shared project MCP config can use:
 
