@@ -6,9 +6,9 @@ Walks JSONL session logs (including nested subagent logs) and produces:
   - SQLite history append (track improvements over time)
 
 Usage:
-  analyzer.py analyze <jsonl-path-or-session-id> [--out DIR]
-  analyzer.py track   <jsonl-path-or-session-id> [--db PATH]
-  analyzer.py history [--skill NAME] [--db PATH]
+  tracer analyze <jsonl-path-or-session-id> [--out DIR]
+  tracer track   <jsonl-path-or-session-id> [--db PATH]
+  tracer history [--skill NAME] [--db PATH]
 """
 from __future__ import annotations
 
@@ -2653,7 +2653,7 @@ def _find_latest_run_dir(session_id: str, project_root: Path | None = None) -> P
 
 
 def main(argv: list[str]):
-    parser = argparse.ArgumentParser(prog="analyzer.py")
+    parser = argparse.ArgumentParser(prog="tracer")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_an = sub.add_parser("analyze", help="parse session, emit trace.json + trace.html")
