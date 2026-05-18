@@ -23,10 +23,13 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+PACKAGE_NAME = "claude-code-tracer"
+__version__ = "0.1.1"
 
 # Legacy central store (still read by `tracer migrate`).
 LEGACY_TRACER_DB_ROOT = Path(
@@ -364,7 +367,7 @@ class Session:
         return mix
 
     def _children(self) -> list["Session"]:
-        # Subagents spawned by clipped-out turns are excluded too.
+        # Legacy soft clips exclude subagents spawned by clipped-out turns.
         return [tc.child_session for t in self.included_turns
                 for tc in t.tool_calls if tc.child_session]
 
@@ -1117,7 +1120,7 @@ def _clip_banner_html(root: Session) -> str:
     start = root.clip.start_turn or 1
     end = root.clip.end_turn or n
     bits = [
-        f"<b>clip active</b>: showing turns <b>{start}..{end}</b> ({kept}/{n} turns); "
+        f"<b>legacy soft clip active</b>: showing turns <b>{start}..{end}</b> ({kept}/{n} turns); "
         f"clipped turns are visually grayed and excluded from totals."
     ]
     if root.clip.reason:
@@ -1360,17 +1363,20 @@ def history(db_path: Path, skill: str | None = None):
 
 
 def find_clip_from(turns: list[Turn], pattern: str) -> tuple[int | None, str]:
-    """Locate the first turn whose content matches `pattern`. Returns
+    """Locate the most recent turn whose content matches `pattern`. Returns
     (1-based turn index or None, what-matched)."""
+    n = len(turns)
     if pattern.startswith("tool:"):
         target = pattern[len("tool:"):]
-        for i, t in enumerate(turns, 1):
+        for offset, t in enumerate(reversed(turns)):
             for tc in t.tool_calls:
                 if tc.name == target:
+                    i = n - offset
                     return (i, f"tool {tc.name}({tc.input_label})")
         return (None, "")
     p = pattern.lower()
-    for i, t in enumerate(turns, 1):
+    for offset, t in enumerate(reversed(turns)):
+        i = n - offset
         for tb in t.text_blocks:
             if p in tb.lower():
                 return (i, f"text in turn {i}")
@@ -1387,11 +1393,15 @@ def apply_clip_flags(
     clip_from: str | None,
     clip_reason: str | None,
 ) -> Clip | None:
-    """Resolve --clip-* flags into a Clip object attached to `root`. Returns
-    the Clip (also sets root.clip), or None if all flags were empty."""
+    """Resolve --clip-* flags and hard-trim root turns.
+
+    Only the root session is sliced; child sessions attached to kept root turns
+    are preserved in full.
+    """
     if clip_start is None and clip_end is None and clip_from is None and clip_reason is None:
         return None
     clip = Clip(reason=clip_reason)
+    total = len(root.turns)
     if clip_start is not None:
         clip.start_turn = clip_start
     if clip_from is not None:
@@ -1402,9 +1412,12 @@ def apply_clip_flags(
         clip.matched_pattern = f"{clip_from} → {matched}"
     if clip_end is not None:
         # --clip-end M means "drop the last M turns of root"
-        keep = max(0, len(root.turns) - clip_end)
-        clip.end_turn = keep if keep > 0 else None
-    root.clip = clip
+        keep = max(0, total - clip_end)
+        clip.end_turn = keep
+    start = max(1, clip.start_turn or 1)
+    end = min(total, clip.end_turn if clip.end_turn is not None else total)
+    root.turns = root.turns[start - 1:end] if start <= end else []
+    root.clip = None
     return clip
 
 
@@ -2647,6 +2660,13 @@ def _find_latest_run_dir(session_id: str, project_root: Path | None = None) -> P
     return None
 
 
+def tracer_version() -> str:
+    try:
+        return package_version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return __version__
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # CLI
 # ────────────────────────────────────────────────────────────────────────────
@@ -2654,6 +2674,7 @@ def _find_latest_run_dir(session_id: str, project_root: Path | None = None) -> P
 
 def main(argv: list[str]):
     parser = argparse.ArgumentParser(prog="tracer")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {tracer_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_an = sub.add_parser("analyze", help="parse session, emit trace.json + trace.html")
@@ -2671,13 +2692,13 @@ def main(argv: list[str]):
     p_an.add_argument("--ascii", action="store_true", help="also emit an ASCII tree (ascii.txt)")
     p_an.add_argument("--print-ascii", action="store_true", help="print ASCII tree to stdout")
     p_an.add_argument("--clip-start", type=int, default=None,
-                      help="drop first N turns of the root session from totals/views")
+                      help="hard clip to start at root turn N")
     p_an.add_argument("--clip-end", type=int, default=None,
-                      help="drop last N turns")
+                      help="hard clip by dropping last N root turns")
     p_an.add_argument("--clip-from", default=None,
-                      help='start at first turn matching pattern '
+                      help='hard clip to start at most recent turn matching pattern '
                            '(substring or "tool:Name")')
-    p_an.add_argument("--clip-reason", default=None, help="note recorded with the clip")
+    p_an.add_argument("--clip-reason", default=None, help="note printed with the clip summary")
 
     p_tr = sub.add_parser("track", help="record session to SQLite history")
     p_tr.add_argument("session")
@@ -2696,6 +2717,8 @@ def main(argv: list[str]):
     p_ls = sub.add_parser("ls", help="list recent sessions for the current cwd")
     p_ls.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
     p_ls.add_argument("--limit", type=int, default=20)
+
+    sub.add_parser("version", help="print tracer version")
 
     p_op = sub.add_parser("open", help="open an analyzed run (ref or current cwd's latest)")
     p_op.add_argument("ref", nargs="?", default=None,
@@ -2724,17 +2747,17 @@ def main(argv: list[str]):
                       help="which artifact's path to print")
     p_pa.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
-    p_cl = sub.add_parser("clip", help="add/modify/reset a clip on an existing trace.json")
+    p_cl = sub.add_parser("clip", help="hard clip an existing trace.json")
     p_cl.add_argument("ref", help="run reference (session id, label, or path)")
     p_cl.add_argument("--start", type=int, default=None,
-                      help="drop first N turns of root session")
+                      help="hard clip to start at root turn N")
     p_cl.add_argument("--end", type=int, default=None,
-                      help="drop last N turns")
+                      help="hard clip by dropping last N root turns")
     p_cl.add_argument("--from", dest="from_pattern", default=None,
-                      help='start at first turn matching pattern')
+                      help='hard clip to start at most recent turn matching pattern')
     p_cl.add_argument("--reason", default=None)
     p_cl.add_argument("--reset", action="store_true",
-                      help="clear any existing clip")
+                      help="clear legacy soft-clip metadata; cannot restore hard-clipped turns")
     p_cl.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
     p_in = sub.add_parser("init", help="create .tracer/ in the current project root")
@@ -2789,6 +2812,7 @@ def main(argv: list[str]):
                   f"({_format_mtime(matches[0].mtime)}, {matches[0].command or 'no command'})")
         root = parse_session(path)
         # Apply --clip-* flags before computing totals or writing trace.json.
+        total_before_clip = len(root.turns)
         clip = apply_clip_flags(
             root,
             clip_start=args.clip_start,
@@ -2797,11 +2821,10 @@ def main(argv: list[str]):
             clip_reason=args.clip_reason,
         )
         if clip:
-            kept = len(root.included_turns)
-            total = len(root.turns)
-            print(f"clip applied: keeping turns "
-                  f"{clip.start_turn or 1}..{clip.end_turn or total} "
-                  f"({kept}/{total} turns kept)"
+            kept = len(root.turns)
+            print(f"hard clip applied: kept original root turns "
+                  f"{clip.start_turn or 1}..{clip.end_turn or total_before_clip} "
+                  f"({kept}/{total_before_clip} turns kept)"
                   + (f" — reason: {clip.reason}" if clip.reason else "")
                   + (f" — matched: {clip.matched_pattern}" if clip.matched_pattern else ""))
         # Resolve label early so we can put it in the run-dir name.
@@ -2898,6 +2921,9 @@ def main(argv: list[str]):
             print(f"  {_format_mtime(s.mtime):<18}{s.session_id[:18]:<20}"
                   f"{(s.command or '—'):<22}{mark:<10}")
 
+    elif args.cmd == "version":
+        print(tracer_version())
+
     elif args.cmd == "path":
         tj = _resolve_run_target(args.ref, resolve_db(args.db))
         run_dir = tj.parent
@@ -2917,6 +2943,7 @@ def main(argv: list[str]):
             root.clip = None
             print(f"clip reset on {tj}")
         else:
+            total_before_clip = len(root.turns)
             clip = apply_clip_flags(
                 root,
                 clip_start=args.start,
@@ -2926,11 +2953,10 @@ def main(argv: list[str]):
             )
             if clip is None:
                 raise SystemExit("no clip flags given (use --start, --end, --from, or --reset)")
-            kept = len(root.included_turns)
-            total = len(root.turns)
-            print(f"clip applied to {tj}: keeping "
-                  f"turns {clip.start_turn or 1}..{clip.end_turn or total} "
-                  f"({kept}/{total} kept)")
+            kept = len(root.turns)
+            print(f"hard clip applied to {tj}: kept original root turns "
+                  f"{clip.start_turn or 1}..{clip.end_turn or total_before_clip} "
+                  f"({kept}/{total_before_clip} kept)")
         # Preserve label/note from existing db row.
         prev_label = prev_note = None
         if db_path.exists():

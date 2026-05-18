@@ -25,6 +25,7 @@ After installation:
 
 ```bash
 tracer --help
+tracer version
 ```
 
 If every user installs `tracer` on `PATH`, a shared project MCP config can use:
@@ -121,13 +122,17 @@ tracer path baseline --view trace
 tracer path baseline --view dir
 ```
 
-Clip irrelevant setup or trailing turns out of an existing trace:
+Hard clip irrelevant setup or trailing turns out of an existing trace:
 
 ```bash
 tracer clip baseline --start 3 --reason "ignore initial setup"
 tracer clip baseline --from "tool:Edit" --reason "start at implementation"
 tracer clip baseline --reset
 ```
+
+Clipping rewrites the trace to keep only the selected root turns. `--from`
+uses the most recent matching turn, so repeated text anchors clip from the
+latest occurrence. Subagent output attached to kept turns is preserved.
 
 ## MCP Server
 
@@ -225,6 +230,9 @@ Common references accepted by MCP tools:
   "emit_ascii_artifact": false
 }
 ```
+
+`clip_from` starts at the most recent matching root turn. Clip options hard
+trim the emitted trace rather than hiding excluded turns.
 
 `trace_open` accepts:
 
