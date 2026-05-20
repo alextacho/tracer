@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Token analyzer for Claude Code sessions.
+"""Token analyzer for coding-agent sessions.
 
-Walks JSONL session logs (including nested subagent logs) and produces:
+Walks JSONL session logs (including nested subagent logs where available) and produces:
   - self-contained HTML trace (chronological view)
   - SQLite history append (track improvements over time)
 
@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 PACKAGE_NAME = "claude-code-tracer"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # Legacy central store (still read by `tracer migrate`).
 LEGACY_TRACER_DB_ROOT = Path(
@@ -73,6 +74,38 @@ def find_project_root(start: str | Path | None) -> Path | None:
         if p == p.parent:
             return None
         p = p.parent
+
+
+def find_init_target_root(start: str | Path | None) -> Path | None:
+    """Find where `tracer init` should create .tracer/.
+
+    Unlike normal trace resolution, init must not treat an ancestor .tracer/
+    directory as the selected project. Otherwise a user-level ~/.tracer can
+    capture initialization for arbitrary folders that do not yet have markers.
+    """
+    if not start:
+        return None
+    p = Path(start).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        return None
+    if not p.exists():
+        return None
+
+    markers = ("package.json", "pyproject.toml", "Cargo.toml", "go.mod")
+    cur = p
+    while True:
+        if (cur / TRACER_DIRNAME).is_dir() and cur == p:
+            return cur
+        if (cur / ".git").is_dir():
+            return cur
+        for m in markers:
+            if (cur / m).exists():
+                return cur
+        if cur == cur.parent:
+            return p
+        cur = cur.parent
 
 
 def project_tracer_dir(project_root: Path, create: bool = True) -> Path:
@@ -214,6 +247,7 @@ class ToolCall:
     result_tokens: int               # approx tokens of tool_result body (chars/4)
     tool_use_id: str
     input_full: dict = field(default_factory=dict)
+    result_content: str = ""         # full tool_result body retained in trace.json
     result_preview: str = ""         # first ~3000 chars of tool result, for trace display
     result_full_chars: int = 0       # full result size, in chars
     timestamp: str = ""              # of the tool_use itself
@@ -303,6 +337,7 @@ class Session:
     cwd: str = ""                    # working directory where session was invoked
     turns: list[Turn] = field(default_factory=list)
     clip: Clip | None = None         # optional clip range on this session
+    source: str = "claude"           # "claude" or "codex"
 
     @property
     def label(self) -> str:
@@ -459,7 +494,32 @@ def _tool_input_label(name: str, inp: dict) -> str:
     return ""
 
 
+def detect_session_source(path: Path) -> str:
+    try:
+        with path.open() as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("type") == "session_meta" and isinstance(row.get("payload"), dict):
+                    return "codex"
+                if row.get("type") in {"user", "assistant"} and "message" in row:
+                    return "claude"
+                break
+    except Exception:
+        pass
+    if CODEX_SESSIONS in path.expanduser().resolve().parents:
+        return "codex"
+    return "claude"
+
+
 def parse_session(path: Path) -> Session:
+    if detect_session_source(path) == "codex":
+        return parse_codex_session(path)
+    return parse_claude_session(path)
+
+
+def parse_claude_session(path: Path) -> Session:
     """Parse a session JSONL and any nested subagent JSONLs."""
     rows = [json.loads(line) for line in path.open()]
 
@@ -481,7 +541,7 @@ def parse_session(path: Path) -> Session:
     #   - tool_results (user messages) by tool_use_id → size
     turns_by_req: dict[str, Turn] = {}
     tool_use_to_turn: dict[str, ToolCall] = {}
-    tool_results: dict[str, tuple[int, str, int]] = {}   # tool_use_id → (result_tokens, preview, full_chars)
+    tool_results: dict[str, tuple[int, str, str, int]] = {}   # tool_use_id → (result_tokens, content, preview, full_chars)
     PREVIEW_CHARS = 3000
 
     for r in rows:
@@ -514,6 +574,7 @@ def parse_session(path: Path) -> Session:
                             body_str = "\n".join(parts)
                         tool_results[c.get("tool_use_id", "")] = (
                             _approx_tokens(body_str),
+                            body_str,
                             body_str[:PREVIEW_CHARS],
                             len(body_str),
                         )
@@ -571,10 +632,11 @@ def parse_session(path: Path) -> Session:
                         think_idx += 1
 
     # Stamp tool_result sizes onto matching tool calls.
-    for tuid, (sz, preview, full_chars) in tool_results.items():
+    for tuid, (sz, content, preview, full_chars) in tool_results.items():
         tc = tool_use_to_turn.get(tuid)
         if tc is not None:
             tc.result_tokens = sz
+            tc.result_content = content
             tc.result_preview = preview
             tc.result_full_chars = full_chars
 
@@ -589,6 +651,7 @@ def parse_session(path: Path) -> Session:
         first_user_prompt=first_user_prompt,
         cwd=cwd,
         turns=turns,
+        source="claude",
     )
 
     # Link subagents: each Agent tool_use should have a corresponding JSONL in
@@ -606,23 +669,234 @@ def parse_session(path: Path) -> Session:
         sub_files.sort(key=lambda p: p.stat().st_mtime)
         for tc, sub_path in zip(agent_calls, sub_files):
             try:
-                tc.child_session = parse_session(sub_path)
+                tc.child_session = parse_claude_session(sub_path)
             except Exception as e:
                 print(f"warning: failed to parse subagent {sub_path}: {e}", file=sys.stderr)
 
     return sess
 
 
-def resolve_input(arg: str) -> Path:
+def _coerce_codex_arguments(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {"arguments": raw}
+    return {"arguments": raw}
+
+
+def _codex_message_text(payload: dict) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text") or block.get("output_text")
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts)
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+    return ""
+
+
+def _is_codex_bootstrap_user_message(text: str) -> bool:
+    stripped = text.lstrip()
+    return (
+        stripped.startswith("# AGENTS.md instructions")
+        or stripped.startswith("<environment_context>")
+    )
+
+
+def _codex_output_text(payload: dict) -> str:
+    output = payload.get("output", "")
+    if isinstance(output, str):
+        return output
+    return json.dumps(output, ensure_ascii=False)
+
+
+def parse_codex_session(path: Path) -> Session:
+    """Parse a Codex rollout JSONL into the common trace model.
+
+    Codex emits a stream of response items and separate token_count events.
+    Each token_count's last_token_usage is treated as the usage for the turn
+    that just completed.
+    """
+    with path.open() as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
+    session_id = path.stem
+    if session_id.startswith("rollout-"):
+        session_id = session_id.rsplit("-", 5)[-5] + "-" + session_id.rsplit("-", 5)[-4] + "-" + session_id.rsplit("-", 5)[-3] + "-" + session_id.rsplit("-", 5)[-2] + "-" + session_id.rsplit("-", 5)[-1]
+
+    cwd = ""
+    model: str | None = None
+    first_user_prompt = ""
+    start_timestamp = ""
+    command = None
+    current_turn_id = ""
+    current_timestamp = ""
+    current_events: list[Event] = []
+    turns: list[Turn] = []
+    tool_use_to_call: dict[str, ToolCall] = {}
+    txt_idx = 0
+    think_idx = 0
+    PREVIEW_CHARS = 3000
+
+    def ensure_turn_id(ts: str = "") -> str:
+        nonlocal current_turn_id, current_timestamp
+        if not current_turn_id:
+            current_turn_id = f"{session_id}:turn:{len(turns) + 1}"
+        if not current_timestamp:
+            current_timestamp = ts or start_timestamp
+        return current_turn_id
+
+    def finish_turn(usage: dict | None, ts: str = ""):
+        nonlocal current_turn_id, current_timestamp, current_events, txt_idx, think_idx
+        if not current_events and not usage:
+            return
+        rid = ensure_turn_id(ts)
+        last = usage or {}
+        input_tokens = int(last.get("input_tokens", 0) or 0)
+        cache_read = int(last.get("cached_input_tokens", 0) or 0)
+        output_tokens = int(last.get("output_tokens", 0) or 0)
+        turns.append(Turn(
+            request_id=rid,
+            timestamp=current_timestamp or ts or start_timestamp,
+            input_tokens=max(0, input_tokens - cache_read),
+            cache_read=cache_read,
+            output_tokens=output_tokens,
+            model=model,
+            events=current_events,
+        ))
+        current_turn_id = ""
+        current_timestamp = ""
+        current_events = []
+        txt_idx = 0
+        think_idx = 0
+
+    for row in rows:
+        rtype = row.get("type")
+        ts = row.get("timestamp", "")
+        payload = row.get("payload", {}) or {}
+
+        if rtype == "session_meta":
+            meta = payload
+            session_id = meta.get("id") or session_id
+            cwd = meta.get("cwd", "") or cwd
+            model = meta.get("model") or meta.get("model_provider") or model
+            start_timestamp = meta.get("timestamp") or ts or start_timestamp
+            continue
+
+        if rtype == "turn_context":
+            current_turn_id = payload.get("turn_id") or current_turn_id
+            cwd = payload.get("cwd", "") or cwd
+            model = payload.get("model") or model
+            current_timestamp = ts or current_timestamp
+            continue
+
+        if rtype == "response_item":
+            ptype = payload.get("type")
+            if ptype == "message":
+                role = payload.get("role")
+                text = _codex_message_text(payload)
+                if role == "user" and text and not first_user_prompt and not _is_codex_bootstrap_user_message(text):
+                    first_user_prompt = text[:200]
+                    m = re.search(r"<command-name>([^<]+)</command-name>", text)
+                    if m:
+                        command = m.group(1).strip()
+                elif role == "assistant" and text.strip():
+                    rid = ensure_turn_id(ts)
+                    current_events.append(TextBlock(id=f"{rid}:txt:{txt_idx}", text=text))
+                    txt_idx += 1
+            elif ptype == "reasoning":
+                content = payload.get("content")
+                if content is None:
+                    content = payload.get("encrypted_content") or payload.get("summary") or ""
+                chars = len(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+                if chars:
+                    rid = ensure_turn_id(ts)
+                    current_events.append(ThinkingBlock(id=f"{rid}:think:{think_idx}", chars=chars))
+                    think_idx += 1
+            elif ptype == "function_call":
+                name = payload.get("name", "?")
+                inp = _coerce_codex_arguments(payload.get("arguments", {}))
+                call_id = payload.get("call_id") or payload.get("id") or f"call-{len(tool_use_to_call) + 1}"
+                tc = ToolCall(
+                    name=name,
+                    input_label=_tool_input_label(name, inp),
+                    result_tokens=0,
+                    tool_use_id=call_id,
+                    input_full=inp,
+                    timestamp=ts,
+                )
+                ensure_turn_id(ts)
+                current_events.append(tc)
+                tool_use_to_call[call_id] = tc
+            elif ptype == "function_call_output":
+                call_id = payload.get("call_id") or payload.get("id") or ""
+                body = _codex_output_text(payload)
+                tc = tool_use_to_call.get(call_id)
+                if tc is not None:
+                    tc.result_tokens = _approx_tokens(body)
+                    tc.result_content = body
+                    tc.result_preview = body[:PREVIEW_CHARS]
+                    tc.result_full_chars = len(body)
+            continue
+
+        if rtype == "event_msg":
+            etype = payload.get("type")
+            if etype == "user_message" and not first_user_prompt:
+                text = str(payload.get("message", ""))
+                if text and not _is_codex_bootstrap_user_message(text):
+                    first_user_prompt = text[:200]
+            elif etype == "token_count":
+                usage = ((payload.get("info") or {}).get("last_token_usage") or {})
+                finish_turn(usage, ts)
+
+    finish_turn(None, rows[-1].get("timestamp", "") if rows else "")
+
+    return Session(
+        path=path,
+        session_id=session_id,
+        agent_type=None,
+        command=command,
+        first_user_prompt=first_user_prompt,
+        cwd=cwd,
+        turns=turns,
+        source="codex",
+    )
+
+
+def resolve_input(arg: str, source: str = "auto") -> Path:
     """Accept a file path, a full session id, or an 8-char (or longer) prefix.
     Searches ~/.claude/projects."""
     p = Path(arg).expanduser()
     if p.is_file():
         return p
-    # Try exact then prefix.
-    candidates = list(CLAUDE_PROJECTS.rglob(f"{arg}.jsonl"))
+    roots = []
+    if source in ("auto", "claude"):
+        roots.append(CLAUDE_PROJECTS)
+    if source in ("auto", "codex"):
+        roots.append(CODEX_SESSIONS)
+    candidates = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        candidates.extend(root.rglob(f"{arg}.jsonl"))
     if not candidates:
-        candidates = list(CLAUDE_PROJECTS.rglob(f"{arg}*.jsonl"))
+        for root in roots:
+            if not root.is_dir():
+                continue
+            candidates.extend(root.rglob(f"*{arg}*.jsonl"))
     candidates = [m for m in candidates if "subagents" not in m.parts]
     if len(candidates) == 1:
         return candidates[0]
@@ -773,6 +1047,10 @@ def _esc(s: str) -> str:
     return _html.escape(s or "", quote=False)
 
 
+def _attr(s: str) -> str:
+    return _html.escape(s or "", quote=True)
+
+
 def _rel_seconds(ts: str, origin: datetime | None) -> str:
     if not ts or origin is None:
         return ""
@@ -846,6 +1124,20 @@ TRACE_HTML_HEAD = r"""<!DOCTYPE html>
     border: 1px solid var(--rule); background: #fff; border-radius: 4px; cursor: pointer; }
   .controls button:hover { background: var(--row-hover); }
   .controls label { margin-right: 14px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .result-open { font: inherit; font-size: 12px; color: #2c5282; padding: 0;
+    border: 0; background: transparent; cursor: pointer; }
+  .result-open:hover { text-decoration: underline; }
+  dialog { width: min(1100px, calc(100vw - 48px)); height: min(760px, calc(100vh - 48px));
+    border: 1px solid var(--rule); border-radius: 6px; padding: 0; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.32); }
+  .modal-head { display: flex; justify-content: space-between; align-items: center;
+    gap: 16px; padding: 10px 12px; border-bottom: 1px solid var(--rule); background: #fff; }
+  .modal-head strong { font-size: 13px; }
+  .modal-head button { font: inherit; padding: 3px 8px; border: 1px solid var(--rule);
+    background: #fff; border-radius: 4px; cursor: pointer; }
+  #result-modal pre { height: calc(100% - 43px); margin: 0; padding: 12px;
+    overflow: auto; background: #f6f5ef; font: 12px/1.45 "SF Mono", Menlo, monospace;
+    white-space: pre-wrap; }
   .trace { background: #fff; border: 1px solid var(--rule); border-radius: 6px; }
   .row { display: grid;
     grid-template-columns: 70px 18px 1fr 230px;
@@ -917,9 +1209,25 @@ __FINDINGS__
 <div class="trace">
 __ROWS__
 </div>
+<dialog id="result-modal">
+  <div class="modal-head">
+    <strong id="result-modal-title">Tool result</strong>
+    <button onclick="document.getElementById('result-modal').close()">Close</button>
+  </div>
+  <pre id="result-modal-body"></pre>
+</dialog>
 <script>
 function toggleType(t, on) {
   document.querySelectorAll('.row.t-'+t).forEach(r => r.classList.toggle('hidden', !on));
+}
+function openResult(button) {
+  const dialog = document.getElementById('result-modal');
+  const title = document.getElementById('result-modal-title');
+  const body = document.getElementById('result-modal-body');
+  const template = button.nextElementSibling;
+  title.textContent = button.dataset.title || 'Tool result';
+  body.textContent = template ? template.content.textContent : '';
+  dialog.showModal();
 }
 </script>
 </body></html>
@@ -1069,11 +1377,30 @@ def _trace_rows(sess: Session, depth: int, origin: datetime | None) -> list[str]
                     "t-agent" + clip_class,
                 ))
                 rows.extend(_trace_rows(sub, depth + 1, origin))
+                return_body = (
+                    f'<span class="label"><span class="label-name">◀ Agent returned</span> '
+                    f'<span style="color:var(--muted)">({_esc(sub.label)})</span></span>'
+                )
+                if tc.result_preview:
+                    truncated_note = (
+                        f" (showing first {len(tc.result_preview):,} of {tc.result_full_chars:,} chars)"
+                        if tc.result_full_chars > len(tc.result_preview) else ""
+                    )
+                    return_body += (
+                        f'<details><summary>result ~{tc.result_tokens:,} tok{truncated_note}</summary>'
+                        f'<pre>{_esc(tc.result_preview)}</pre></details>'
+                    )
+                    if tc.result_content and tc.result_full_chars > len(tc.result_preview):
+                        return_body += (
+                            f'<button class="result-open" data-title="Agent result '
+                            f'({tc.result_full_chars:,} chars)" onclick="openResult(this)">'
+                            f'Show full result</button>'
+                            f'<template>{_esc(tc.result_content)}</template>'
+                        )
                 rows.append(_emit_row(
                     "",
                     "◀",
-                    f'<span class="label"><span class="label-name">◀ Agent returned</span> '
-                    f'<span style="color:var(--muted)">({_esc(sub.label)})</span></span>',
+                    return_body,
                     f"result ~{tc.result_tokens:,} tok",
                     depth,
                     "t-agent-end" + clip_class,
@@ -1101,6 +1428,13 @@ def _trace_rows(sess: Session, depth: int, origin: datetime | None) -> list[str]
                         f'<details><summary>result ~{tc.result_tokens:,} tok{truncated_note}</summary>'
                         f'<pre>{_esc(tc.result_preview)}</pre></details>'
                     )
+                    if tc.result_content and tc.result_full_chars > len(tc.result_preview):
+                        body += (
+                            f'<button class="result-open" data-title="{_attr(tc.name)} result '
+                            f'({tc.result_full_chars:,} chars)" onclick="openResult(this)">'
+                            f'Show full result</button>'
+                            f'<template>{_esc(tc.result_content)}</template>'
+                        )
                 rows.append(_emit_row(
                     ts,
                     "●",
@@ -1218,7 +1552,8 @@ def _ensure_db(db_path: Path) -> sqlite3.Connection:
     )
     # Idempotent column adds for backwards-compatible schema evolution.
     for col_decl in ("label TEXT", "note TEXT", "trace_dir TEXT", "cwd TEXT",
-                     "dollars REAL", "n_unpriced_turns INTEGER", "model_mix TEXT"):
+                     "dollars REAL", "n_unpriced_turns INTEGER", "model_mix TEXT",
+                     "source TEXT"):
         try:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col_decl}")
         except sqlite3.OperationalError:
@@ -1271,8 +1606,8 @@ def track(
             "(session_id, command, first_prompt, started_at, wall_seconds, "
             "n_sessions, n_turns, billable_input, cache_creation, cache_read, "
             "output_tokens, cost_weighted, label, note, trace_dir, cwd, "
-            "dollars, n_unpriced_turns, model_mix) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "dollars, n_unpriced_turns, model_mix, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 root.session_id,
                 root.command,
@@ -1293,6 +1628,7 @@ def track(
                 total_d if total_d > 0 else None,
                 total_u,
                 model_mix,
+                root.source,
             ),
         )
     tag = f" [{label}]" if label else ""
@@ -1445,6 +1781,7 @@ def _event_to_json(e: Event) -> dict:
             "result": {
                 "tokens": e.result_tokens,
                 "full_chars": e.result_full_chars,
+                "content": e.result_content,
                 "preview": e.result_preview,
             },
         }
@@ -1477,6 +1814,7 @@ def _session_to_json(s: Session) -> dict:
     tot_d, tot_u = s.total_dollars
     return {
         "id": s.session_id,
+        "source": s.source,
         "agent_type": s.agent_type,
         "command": s.command,
         "cwd": s.cwd,
@@ -1557,10 +1895,15 @@ def _event_from_json(d: dict) -> Event:
             result_tokens=res.get("tokens", 0),
             tool_use_id=d["id"],
             input_full=d.get("input", {}) or {},
+            result_content=res.get("content", res.get("preview", "")),
             result_preview=res.get("preview", ""),
             result_full_chars=res.get("full_chars", 0),
             timestamp=d.get("timestamp", ""),
         )
+        if tc.result_content and not tc.result_preview:
+            tc.result_preview = tc.result_content[:3000]
+        if tc.result_content and not tc.result_full_chars:
+            tc.result_full_chars = len(tc.result_content)
         if d.get("child_session"):
             tc.child_session = _session_from_json(d["child_session"])
         return tc
@@ -1591,6 +1934,7 @@ def _session_from_json(d: dict) -> Session:
         first_user_prompt=d.get("first_user_prompt", ""),
         cwd=d.get("cwd", ""),
         turns=[_turn_from_json(t) for t in d.get("turns", [])],
+        source=d.get("source", "claude"),
     )
     c = d.get("clip")
     if c:
@@ -1625,7 +1969,7 @@ def cmd_init(here: bool, skip_gitignore_prompt: bool):
     if here:
         target = Path(cwd).resolve()
     else:
-        target = find_project_root(cwd)
+        target = find_init_target_root(cwd)
         if target is None:
             print(f"no project root found above {cwd}", file=sys.stderr)
             print("hint: run `tracer init --here` to use the current directory anyway",
@@ -1747,6 +2091,13 @@ def default_run_dir(root: Session, label_hint: str | None = None) -> Path:
         safe = re.sub(r"[^A-Za-z0-9._@-]", "-", label_hint).strip("-")[:48]
         return project_traces_dir(proj_root) / f"{iso_safe}__{sid8}__{safe}"
     return project_traces_dir(proj_root) / f"{iso_safe}__{sid8}"
+
+
+def resolve_output_dir(root: Session, out_arg: str | None, label_hint: str | None = None) -> Path:
+    """Resolve artifact output dir without touching project storage when --out is set."""
+    if out_arg:
+        return Path(out_arg).expanduser().resolve()
+    return default_run_dir(root, label_hint=label_hint)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2141,6 +2492,7 @@ def _mcp_suggestions(root: Session, summary: dict | None = None) -> list[dict]:
 def mcp_trace_create(
     session: str | None = None,
     cwd: str | None = None,
+    source: str = "auto",
     label: str | None = None,
     note: str | None = None,
     clip_start: int | None = None,
@@ -2150,12 +2502,12 @@ def mcp_trace_create(
     emit_ascii_artifact: bool = False,
 ) -> dict:
     if session:
-        path = resolve_input(session)
+        path = resolve_input(session, source=source)
     else:
         cwd_for_lookup = cwd or os.getcwd()
-        matches = find_sessions_for_cwd(cwd_for_lookup)
+        matches = find_sessions_for_cwd(cwd_for_lookup, source=source)
         if not matches:
-            raise SystemExit(f"no Claude Code sessions found for cwd: {cwd_for_lookup}")
+            raise SystemExit(f"no sessions found for cwd: {cwd_for_lookup}")
         path = matches[0].path
     root = parse_session(path)
     apply_clip_flags(root, clip_start, clip_end, clip_from, clip_reason)
@@ -2174,6 +2526,7 @@ def mcp_trace_create(
     track(root, db_path, label=label, note=note, trace_dir=out_dir)
     return {
         "session_id": root.session_id,
+        "source": root.source,
         "label": label,
         "project_root": str(session_project_root(root)),
         "db": str(db_path),
@@ -2337,12 +2690,13 @@ def mcp_trace_suggest_improvements(ref: str | None = "latest", cwd: str | None =
 
 MCP_TOOLS = {
     "trace_create": {
-        "description": "Analyze a Claude Code session, emit trace.json/trace.html, and track it in the project history.",
+        "description": "Analyze a Claude Code or Codex session, emit trace.json/trace.html, and track it in the project history.",
         "schema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string", "description": "Session id, JSONL path, or omitted for latest session in cwd."},
                 "cwd": {"type": "string", "description": "Project cwd used when session is omitted."},
+                "source": {"type": "string", "enum": ["auto", "claude", "codex"], "default": "auto"},
                 "label": {"type": "string"},
                 "note": {"type": "string"},
                 "clip_start": {"type": "integer"},
@@ -2464,7 +2818,7 @@ def mcp_serve():
             if method == "initialize":
                 _mcp_result(req_id, {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                    "serverInfo": {"name": "tracer", "version": "0.1.0"},
+                    "serverInfo": {"name": "tracer", "version": tracer_version()},
                     "capabilities": {"tools": {}},
                 })
             elif method == "notifications/initialized":
@@ -2542,9 +2896,8 @@ def cmd_mcp_remove(scope: str | None, name: str):
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _iter_session_files() -> Iterable[Path]:
-    """Yield every top-level session JSONL across all Claude Code projects.
-    Skip subagent JSONLs (they live under <session-id>/subagents/)."""
+def _iter_claude_session_files() -> Iterable[Path]:
+    """Yield every top-level session JSONL across all Claude Code projects."""
     if not CLAUDE_PROJECTS.is_dir():
         return
     for proj in CLAUDE_PROJECTS.iterdir():
@@ -2554,6 +2907,22 @@ def _iter_session_files() -> Iterable[Path]:
             if "subagents" in f.parts:
                 continue
             yield f
+
+
+def _iter_codex_session_files() -> Iterable[Path]:
+    """Yield Codex rollout JSONL files."""
+    if not CODEX_SESSIONS.is_dir():
+        return
+    yield from CODEX_SESSIONS.rglob("rollout-*.jsonl")
+
+
+def _iter_session_files(source: str = "auto") -> Iterable[tuple[str, Path]]:
+    if source in ("auto", "claude"):
+        for f in _iter_claude_session_files():
+            yield ("claude", f)
+    if source in ("auto", "codex"):
+        for f in _iter_codex_session_files():
+            yield ("codex", f)
 
 
 def _session_cwd_quick(path: Path, max_lines: int = 30) -> str:
@@ -2589,6 +2958,38 @@ def _session_first_command(path: Path, max_lines: int = 30) -> str:
     return ""
 
 
+def _codex_session_quick(path: Path, max_lines: int = 80) -> tuple[str, str]:
+    cwd = ""
+    prompt = ""
+    try:
+        with path.open() as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                payload = r.get("payload", {}) or {}
+                if r.get("type") == "session_meta":
+                    cwd = payload.get("cwd", "") or cwd
+                elif r.get("type") == "turn_context":
+                    cwd = payload.get("cwd", "") or cwd
+                elif r.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                    text = _codex_message_text(payload)
+                    if text and not _is_codex_bootstrap_user_message(text):
+                        prompt = text[:120]
+                elif r.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    text = str(payload.get("message", ""))
+                    if text and not _is_codex_bootstrap_user_message(text):
+                        prompt = text[:120]
+                if cwd and prompt:
+                    break
+    except Exception:
+        pass
+    return cwd, prompt
+
+
 @dataclass
 class SessionSummary:
     path: Path
@@ -2596,24 +2997,33 @@ class SessionSummary:
     cwd: str
     command: str
     mtime: float
+    source: str = "claude"
 
 
-def find_sessions_for_cwd(cwd: str) -> list[SessionSummary]:
+def find_sessions_for_cwd(cwd: str, source: str = "auto") -> list[SessionSummary]:
     """Return sessions whose recorded cwd matches `cwd`, sorted newest-first."""
     cwd_n = os.path.realpath(os.path.expanduser(cwd)).rstrip("/")
     results: list[SessionSummary] = []
-    for f in _iter_session_files():
-        sc = _session_cwd_quick(f)
+    for src, f in _iter_session_files(source):
+        if src == "codex":
+            sc, command = _codex_session_quick(f)
+            sid = f.stem.rsplit("-", 5)
+            session_id = "-".join(sid[-5:]) if len(sid) >= 6 else f.stem
+        else:
+            sc = _session_cwd_quick(f)
+            command = _session_first_command(f)
+            session_id = f.stem
         if not sc:
             continue
         if os.path.realpath(sc).rstrip("/") != cwd_n:
             continue
         results.append(SessionSummary(
             path=f,
-            session_id=f.stem,
+            session_id=session_id,
             cwd=sc,
-            command=_session_first_command(f),
+            command=command,
             mtime=f.stat().st_mtime,
+            source=src,
         ))
     results.sort(key=lambda s: -s.mtime)
     return results
@@ -2680,6 +3090,8 @@ def main(argv: list[str]):
     p_an = sub.add_parser("analyze", help="parse session, emit trace.json + trace.html")
     p_an.add_argument("session", nargs="?", default=None,
                       help="path to JSONL or session id (default: newest session for cwd)")
+    p_an.add_argument("--source", default="auto", choices=["auto", "claude", "codex"],
+                      help="session source to search when resolving input (default: auto)")
     p_an.add_argument("--out", default=None,
                       help="output dir (default: <project>/.tracer/traces/<run-dir>/)")
     p_an.add_argument("--no-track", action="store_true",
@@ -2702,6 +3114,7 @@ def main(argv: list[str]):
 
     p_tr = sub.add_parser("track", help="record session to SQLite history")
     p_tr.add_argument("session")
+    p_tr.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
     p_tr.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
     p_hi = sub.add_parser("history", help="show recorded runs in the current project")
@@ -2716,6 +3129,7 @@ def main(argv: list[str]):
 
     p_ls = sub.add_parser("ls", help="list recent sessions for the current cwd")
     p_ls.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
+    p_ls.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
     p_ls.add_argument("--limit", type=int, default=20)
 
     sub.add_parser("version", help="print tracer version")
@@ -2798,17 +3212,17 @@ def main(argv: list[str]):
 
     elif args.cmd == "analyze":
         if args.session:
-            path = resolve_input(args.session)
+            path = resolve_input(args.session, source=args.source)
         else:
             cwd = os.getcwd()
-            matches = find_sessions_for_cwd(cwd)
+            matches = find_sessions_for_cwd(cwd, source=args.source)
             if not matches:
                 raise SystemExit(
-                    f"no Claude Code sessions found for cwd: {cwd}\n"
-                    f"(walked {CLAUDE_PROJECTS})"
+                    f"no sessions found for cwd: {cwd}\n"
+                    f"(walked {CLAUDE_PROJECTS} and {CODEX_SESSIONS})"
                 )
             path = matches[0].path
-            print(f"latest session for {cwd}: {matches[0].session_id} "
+            print(f"latest {matches[0].source} session for {cwd}: {matches[0].session_id} "
                   f"({_format_mtime(matches[0].mtime)}, {matches[0].command or 'no command'})")
         root = parse_session(path)
         # Apply --clip-* flags before computing totals or writing trace.json.
@@ -2853,8 +3267,7 @@ def main(argv: list[str]):
                 print(f"label (auto): {label}")
 
         # Resolve output dir: --out wins; else project's .tracer/traces/<run>.
-        default_dir = default_run_dir(root, label_hint=label)
-        out_dir = Path(args.out).expanduser().resolve() if args.out else default_dir
+        out_dir = resolve_output_dir(root, args.out, label_hint=label)
         out_dir.mkdir(parents=True, exist_ok=True)
         trace_json = out_dir / "trace.json"
         trace = out_dir / "trace.html"
@@ -2882,7 +3295,7 @@ def main(argv: list[str]):
             track(root, db_path, label=label, note=note, trace_dir=out_dir)
 
     elif args.cmd == "track":
-        path = resolve_input(args.session)
+        path = resolve_input(args.session, source=args.source)
         sess = parse_session(path)
         track(sess, resolve_db(args.db, for_session=sess))
 
@@ -2901,7 +3314,7 @@ def main(argv: list[str]):
 
     elif args.cmd == "ls":
         cwd = args.cwd or os.getcwd()
-        matches = find_sessions_for_cwd(cwd)
+        matches = find_sessions_for_cwd(cwd, source=args.source)
         if not matches:
             print(f"no sessions for cwd: {cwd}")
             return
@@ -2914,11 +3327,11 @@ def main(argv: list[str]):
                 conn = sqlite3.connect(db)
                 seen = {r[0] for r in conn.execute("SELECT session_id FROM runs")}
         print(f"sessions for {cwd}:")
-        print(f"  {'when':<18}{'session id':<20}{'command':<22}{'analyzed':<10}")
-        print("  " + "-" * 70)
+        print(f"  {'when':<18}{'source':<8}{'session id':<20}{'command':<22}{'analyzed':<10}")
+        print("  " + "-" * 78)
         for s in matches[: args.limit]:
             mark = "✓" if s.session_id in seen else ""
-            print(f"  {_format_mtime(s.mtime):<18}{s.session_id[:18]:<20}"
+            print(f"  {_format_mtime(s.mtime):<18}{s.source:<8}{s.session_id[:18]:<20}"
                   f"{(s.command or '—'):<22}{mark:<10}")
 
     elif args.cmd == "version":

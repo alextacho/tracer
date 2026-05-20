@@ -1,6 +1,6 @@
 # Tracer
 
-Tracer analyzes Claude Code session logs and turns them into stored trace artifacts:
+Tracer analyzes Claude Code and Codex session logs and turns them into stored trace artifacts:
 
 - `trace.json` as the canonical machine-readable trace
 - `trace.html` as a chronological browser view
@@ -64,10 +64,11 @@ Trace artifacts can be large, so `tracer init` can add `.tracer/traces/` to `.gi
 
 ## CLI Usage
 
-List recent Claude Code sessions for the current directory:
+List recent Claude Code and Codex sessions for the current directory:
 
 ```bash
 tracer ls
+tracer ls --source codex
 ```
 
 Analyze the latest session for the current directory:
@@ -80,6 +81,7 @@ Analyze a specific session:
 
 ```bash
 tracer analyze <session-id-or-jsonl-path> --label "baseline"
+tracer analyze --source codex --label "codex-run"
 ```
 
 Open the latest analyzed trace:
@@ -133,6 +135,11 @@ tracer clip baseline --reset
 Clipping rewrites the trace to keep only the selected root turns. `--from`
 uses the most recent matching turn, so repeated text anchors clip from the
 latest occurrence. Subagent output attached to kept turns is preserved.
+
+Tool results inside the retained clip are stored fully in `trace.json`.
+`trace.html` shows compact previews by default and exposes full results on
+demand, so the JSON artifact remains faithful even if the original Claude
+JSONL logs or files read during the session are later removed or changed.
 
 ## MCP Server
 
@@ -263,6 +270,6 @@ The SQLite database stores run metadata and paths. The trace directory stores th
 
 ## Notes
 
-- Tracer reads Claude Code logs from `~/.claude/projects`.
-- `trace.json` is the source of truth; `trace.html` can be regenerated with `tracer render`.
+- Tracer reads Claude Code logs from `~/.claude/projects` and Codex rollout logs from `~/.codex/sessions`.
+- `trace.json` is the source of truth, including full retained tool results; `trace.html` can be regenerated with `tracer render`.
 - MCP `trace_open` uses macOS `open`. In headless environments it may return the path without successfully opening the artifact.
