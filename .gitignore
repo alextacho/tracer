@@ -9,3 +9,4 @@ venv/
 # Local tracer output
 .tracer/traces/
 .tracer/runs.db
+.tracer/lab.db

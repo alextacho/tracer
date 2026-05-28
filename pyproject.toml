@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-code-tracer"
-version = "0.1.2"
-description = "Analyze Claude Code session traces and expose them through a CLI and MCP server."
+name = "tracer"
+version = "0.1.3"
+description = "Create, review, and compare coding-agent trace artifacts through a CLI, local Lab, and MCP server."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [
   { name = "Tracer contributors" }
 ]
-keywords = ["claude-code", "mcp", "trace", "token-analysis"]
+keywords = ["claude-code", "codex", "mcp", "trace", "agent-review", "token-analysis"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -22,12 +22,17 @@ classifiers = [
 ]
 
 [project.scripts]
-tracer = "analyzer:main_entry"
+tracer = "tracer.core:main_entry"
+tracer-lab = "tracer.lab.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/alextacho/tracer"
 Repository = "https://github.com/alextacho/tracer"
 Issues = "https://github.com/alextacho/tracer/issues"
 
-[tool.setuptools]
-py-modules = ["analyzer"]
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tracer*"]
+
+[tool.setuptools.package-data]
+"tracer.lab" = ["static/*.css", "static/*.js"]

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Tiny shim so `tracer-lab` can live on PATH from a source checkout.
+SELF="$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")"
+DIR="$(dirname "$SELF")"
+PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tracer.lab.cli "$@"

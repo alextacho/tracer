@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Token analyzer for coding-agent sessions.
+"""Trace artifact tool for coding-agent sessions.
 
 Walks JSONL session logs (including nested subagent logs where available) and produces:
   - self-contained HTML trace (chronological view)
   - SQLite history append (track improvements over time)
 
 Usage:
-  tracer analyze <jsonl-path-or-session-id> [--out DIR]
-  tracer track   <jsonl-path-or-session-id> [--db PATH]
-  tracer history [--skill NAME] [--db PATH]
+  tracer save    <jsonl-path-or-session-id> [--out DIR]
+  tracer read    <ref-or-trace-json>
+  tracer open    <ref-or-trace-json>
 """
 from __future__ import annotations
 
@@ -23,16 +23,14 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-PACKAGE_NAME = "claude-code-tracer"
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
-# Legacy central store (still read by `tracer migrate`).
+# Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
     os.environ.get(
         "TRACER_DB_ROOT",
@@ -62,9 +60,18 @@ def find_project_root(start: str | Path | None) -> Path | None:
         return None
     if not p.exists():
         return None
+    start_path = p
+    home_root = Path.home().resolve()
+    home_tracer = (Path.home() / TRACER_DIRNAME).resolve()
     markers = ("package.json", "pyproject.toml", "Cargo.toml", "go.mod")
     while True:
-        if (p / TRACER_DIRNAME).is_dir():
+        if p == home_root and p != start_path:
+            if p == p.parent:
+                return None
+            p = p.parent
+            continue
+        tracer_dir = p / TRACER_DIRNAME
+        if tracer_dir.is_dir() and not (tracer_dir.resolve() == home_tracer and p != start_path):
             return p
         if (p / ".git").is_dir():
             return p
@@ -77,9 +84,9 @@ def find_project_root(start: str | Path | None) -> Path | None:
 
 
 def find_init_target_root(start: str | Path | None) -> Path | None:
-    """Find where `tracer init` should create .tracer/.
+    """Find where internal initialization should create .tracer/.
 
-    Unlike normal trace resolution, init must not treat an ancestor .tracer/
+    Unlike normal trace resolution, initialization must not treat an ancestor .tracer/
     directory as the selected project. Otherwise a user-level ~/.tracer can
     capture initialization for arbitrary folders that do not yet have markers.
     """
@@ -131,7 +138,7 @@ def active_project_root(cwd: str | None = None, *, error_if_missing: bool = True
         raise SystemExit(
             f"not inside a tracer project: walked up from {here} and didn't find\n"
             f"  a .tracer/, .git/, or recognized project marker.\n"
-            f"  Run `tracer init` here to create one."
+            f"  Run `tracer save` from a project directory to create one."
         )
     return root
 
@@ -142,7 +149,7 @@ def session_project_root(session: "Session") -> Path:
         r = find_project_root(session.cwd)
         if r:
             return r
-        return Path(session.cwd)
+        return Path(session.cwd).expanduser().resolve()
     return Path(os.getcwd())
 
 
@@ -255,6 +262,13 @@ class ToolCall:
 
 
 @dataclass
+class UserMessage:
+    id: str                          # "<request_id>:user:<idx>"
+    text: str
+    timestamp: str = ""
+
+
+@dataclass
 class TextBlock:
     id: str                          # "<request_id>:txt:<idx>"
     text: str
@@ -266,9 +280,9 @@ class ThinkingBlock:
     chars: int                       # length (content usually signed/opaque)
 
 
-# An Event is one of: TextBlock | ThinkingBlock | ToolCall, retained in the
+# An Event is one of: UserMessage | TextBlock | ThinkingBlock | ToolCall, retained in the
 # order the model emitted them within a single turn.
-Event = "TextBlock | ThinkingBlock | ToolCall"
+Event = "UserMessage | TextBlock | ThinkingBlock | ToolCall"
 
 
 @dataclass
@@ -283,6 +297,10 @@ class Turn:
     events: list = field(default_factory=list)  # ordered list of Event
 
     # ── Aggregate views ───────────────────────────────────────────────
+    @property
+    def user_messages(self) -> list[str]:
+        return [e.text for e in self.events if isinstance(e, UserMessage)]
+
     @property
     def text_blocks(self) -> list[str]:
         return [e.text for e in self.events if isinstance(e, TextBlock)]
@@ -521,7 +539,8 @@ def parse_session(path: Path) -> Session:
 
 def parse_claude_session(path: Path) -> Session:
     """Parse a session JSONL and any nested subagent JSONLs."""
-    rows = [json.loads(line) for line in path.open()]
+    with path.open() as fh:
+        rows = [json.loads(line) for line in fh]
 
     session_id = path.stem
     agent_type = None
@@ -542,7 +561,41 @@ def parse_claude_session(path: Path) -> Session:
     turns_by_req: dict[str, Turn] = {}
     tool_use_to_turn: dict[str, ToolCall] = {}
     tool_results: dict[str, tuple[int, str, str, int]] = {}   # tool_use_id → (result_tokens, content, preview, full_chars)
+    pending_user_messages: list[tuple[str, str]] = []
     PREVIEW_CHARS = 3000
+
+    def capture_user_message(text: str, ts: str = ""):
+        nonlocal first_user_prompt, command
+        if not text.strip():
+            return
+        if not first_user_prompt:
+            m = re.search(r"<command-name>([^<]+)</command-name>", text)
+            if m:
+                command = m.group(1).strip()
+            first_user_prompt = text[:200]
+        pending_user_messages.append((ts, text))
+
+    def ensure_claude_turn(rid: str, timestamp: str, usage: dict, model: str | None) -> Turn:
+        turn = turns_by_req.get(rid)
+        if turn is None:
+            turn = Turn(
+                request_id=rid,
+                timestamp=timestamp,
+                input_tokens=usage.get("input_tokens", 0) or 0,
+                cache_creation=usage.get("cache_creation_input_tokens", 0) or 0,
+                cache_read=usage.get("cache_read_input_tokens", 0) or 0,
+                output_tokens=usage.get("output_tokens", 0) or 0,
+                model=model,
+            )
+            for idx, (user_ts, text) in enumerate(pending_user_messages):
+                turn.events.append(UserMessage(
+                    id=f"{rid}:user:{idx}",
+                    text=text,
+                    timestamp=user_ts,
+                ))
+            pending_user_messages.clear()
+            turns_by_req[rid] = turn
+        return turn
 
     for r in rows:
         rtype = r.get("type")
@@ -553,11 +606,8 @@ def parse_claude_session(path: Path) -> Session:
 
         if rtype == "user":
             # Capture first slash-command or first user prompt.
-            if isinstance(content, str) and not first_user_prompt:
-                m = re.search(r"<command-name>([^<]+)</command-name>", content)
-                if m:
-                    command = m.group(1).strip()
-                first_user_prompt = content[:200]
+            if isinstance(content, str):
+                capture_user_message(content, r.get("timestamp", ""))
             elif isinstance(content, list):
                 for c in content:
                     if c.get("type") == "tool_result":
@@ -578,26 +628,15 @@ def parse_claude_session(path: Path) -> Session:
                             body_str[:PREVIEW_CHARS],
                             len(body_str),
                         )
-                    elif c.get("type") == "text" and not first_user_prompt:
-                        first_user_prompt = (c.get("text") or "")[:200]
+                    elif c.get("type") == "text":
+                        capture_user_message(c.get("text") or "", r.get("timestamp", ""))
 
         elif rtype == "assistant":
             rid = r.get("requestId")
             if not rid:
                 continue
-            turn = turns_by_req.get(rid)
-            if turn is None:
-                usage = msg.get("usage", {}) or {}
-                turn = Turn(
-                    request_id=rid,
-                    timestamp=r.get("timestamp", ""),
-                    input_tokens=usage.get("input_tokens", 0) or 0,
-                    cache_creation=usage.get("cache_creation_input_tokens", 0) or 0,
-                    cache_read=usage.get("cache_read_input_tokens", 0) or 0,
-                    output_tokens=usage.get("output_tokens", 0) or 0,
-                    model=msg.get("model"),
-                )
-                turns_by_req[rid] = turn
+            usage = msg.get("usage", {}) or {}
+            turn = ensure_claude_turn(rid, r.get("timestamp", ""), usage, msg.get("model"))
             if isinstance(content, list):
                 # Track per-turn counters for synthesizing stable IDs.
                 txt_idx = sum(1 for e in turn.events if isinstance(e, TextBlock))
@@ -747,6 +786,7 @@ def parse_codex_session(path: Path) -> Session:
     current_events: list[Event] = []
     turns: list[Turn] = []
     tool_use_to_call: dict[str, ToolCall] = {}
+    user_idx = 0
     txt_idx = 0
     think_idx = 0
     PREVIEW_CHARS = 3000
@@ -759,8 +799,27 @@ def parse_codex_session(path: Path) -> Session:
             current_timestamp = ts or start_timestamp
         return current_turn_id
 
+    def append_user_message(text: str, ts: str = ""):
+        nonlocal first_user_prompt, command, user_idx
+        if not text or _is_codex_bootstrap_user_message(text):
+            return
+        if current_events and isinstance(current_events[-1], UserMessage) and current_events[-1].text == text:
+            return
+        if not first_user_prompt:
+            first_user_prompt = text[:200]
+            m = re.search(r"<command-name>([^<]+)</command-name>", text)
+            if m:
+                command = m.group(1).strip()
+        rid = ensure_turn_id(ts)
+        current_events.append(UserMessage(
+            id=f"{rid}:user:{user_idx}",
+            text=text,
+            timestamp=ts,
+        ))
+        user_idx += 1
+
     def finish_turn(usage: dict | None, ts: str = ""):
-        nonlocal current_turn_id, current_timestamp, current_events, txt_idx, think_idx
+        nonlocal current_turn_id, current_timestamp, current_events, user_idx, txt_idx, think_idx
         if not current_events and not usage:
             return
         rid = ensure_turn_id(ts)
@@ -780,6 +839,7 @@ def parse_codex_session(path: Path) -> Session:
         current_turn_id = ""
         current_timestamp = ""
         current_events = []
+        user_idx = 0
         txt_idx = 0
         think_idx = 0
 
@@ -808,11 +868,8 @@ def parse_codex_session(path: Path) -> Session:
             if ptype == "message":
                 role = payload.get("role")
                 text = _codex_message_text(payload)
-                if role == "user" and text and not first_user_prompt and not _is_codex_bootstrap_user_message(text):
-                    first_user_prompt = text[:200]
-                    m = re.search(r"<command-name>([^<]+)</command-name>", text)
-                    if m:
-                        command = m.group(1).strip()
+                if role == "user":
+                    append_user_message(text, ts)
                 elif role == "assistant" and text.strip():
                     rid = ensure_turn_id(ts)
                     current_events.append(TextBlock(id=f"{rid}:txt:{txt_idx}", text=text))
@@ -854,10 +911,9 @@ def parse_codex_session(path: Path) -> Session:
 
         if rtype == "event_msg":
             etype = payload.get("type")
-            if etype == "user_message" and not first_user_prompt:
+            if etype == "user_message":
                 text = str(payload.get("message", ""))
-                if text and not _is_codex_bootstrap_user_message(text):
-                    first_user_prompt = text[:200]
+                append_user_message(text, ts)
             elif etype == "token_count":
                 usage = ((payload.get("info") or {}).get("last_token_usage") or {})
                 finish_turn(usage, ts)
@@ -1329,6 +1385,27 @@ def _trace_rows(sess: Session, depth: int, origin: datetime | None) -> list[str]
             "t-divider" + clip_class,
         ))
 
+        # User messages that prompted this turn.
+        for e in turn.events:
+            if not isinstance(e, UserMessage):
+                continue
+            preview = e.text.strip().replace("\n", " ")
+            short = preview[:200] + ("…" if len(preview) > 200 else "")
+            body = f'<span class="label"><span class="label-name">user</span> {_esc(short)}</span>'
+            if len(e.text) > 200:
+                body += (
+                    f'<details><summary>full user message ({len(e.text):,} chars)</summary>'
+                    f'<pre>{_esc(e.text)}</pre></details>'
+                )
+            rows.append(_emit_row(
+                _rel_seconds(e.timestamp or turn.timestamp, origin),
+                "▸",
+                body,
+                "",
+                depth,
+                "t-user" + clip_class,
+            ))
+
         # Assistant text blocks for this turn (model output)
         for tx_idx, txt in enumerate(turn.text_blocks):
             preview = txt.strip().replace("\n", " ")
@@ -1475,7 +1552,12 @@ def emit_trace_html(root: Session, out_path: Path):
 
     rows = []
     # Lead row: the user prompt that started the session
-    if root.first_user_prompt:
+    has_user_events = any(
+        isinstance(e, UserMessage)
+        for turn in root.turns
+        for e in turn.events
+    )
+    if root.first_user_prompt and not has_user_events:
         rows.append(_emit_row(
             "+0.0s",
             "▸",
@@ -1713,6 +1795,9 @@ def find_clip_from(turns: list[Turn], pattern: str) -> tuple[int | None, str]:
     p = pattern.lower()
     for offset, t in enumerate(reversed(turns)):
         i = n - offset
+        for um in t.user_messages:
+            if p in um.lower():
+                return (i, f"user message in turn {i}")
         for tb in t.text_blocks:
             if p in tb.lower():
                 return (i, f"text in turn {i}")
@@ -1766,6 +1851,8 @@ SCHEMA_VERSION = 1
 
 
 def _event_to_json(e: Event) -> dict:
+    if isinstance(e, UserMessage):
+        return {"kind": "user", "id": e.id, "text": e.text, "timestamp": e.timestamp}
     if isinstance(e, TextBlock):
         return {"kind": "text", "id": e.id, "text": e.text}
     if isinstance(e, ThinkingBlock):
@@ -1883,6 +1970,8 @@ def emit_trace_json(root: Session, out_path: Path):
 
 def _event_from_json(d: dict) -> Event:
     k = d.get("kind")
+    if k == "user":
+        return UserMessage(id=d["id"], text=d["text"], timestamp=d.get("timestamp", ""))
     if k == "text":
         return TextBlock(id=d["id"], text=d["text"])
     if k == "thinking":
@@ -1952,7 +2041,7 @@ def load_trace_json(path: Path) -> Session:
     if doc.get("schema_version") != SCHEMA_VERSION:
         print(
             f"warning: trace.json schema_version {doc.get('schema_version')} "
-            f"≠ analyzer SCHEMA_VERSION {SCHEMA_VERSION}",
+            f"!= tracer schema version {SCHEMA_VERSION}",
             file=sys.stderr,
         )
     return _session_from_json(doc["session"])
@@ -1972,7 +2061,7 @@ def cmd_init(here: bool, skip_gitignore_prompt: bool):
         target = find_init_target_root(cwd)
         if target is None:
             print(f"no project root found above {cwd}", file=sys.stderr)
-            print("hint: run `tracer init --here` to use the current directory anyway",
+            print("hint: pass here=True to initialize the current directory anyway",
                   file=sys.stderr)
             raise SystemExit(2)
     tdir = target / TRACER_DIRNAME
@@ -1983,7 +2072,7 @@ def cmd_init(here: bool, skip_gitignore_prompt: bool):
         # Touch config.json with empty contents to make the dir's role obvious.
         (tdir / TRACER_CONFIG).write_text("{}\n")
         print(f"created: {tdir}")
-        print(f"  ├── runs.db        (created on first analyze)")
+        print(f"  ├── runs.db        (created on first save)")
         print(f"  ├── config.json    (per-project overrides — currently empty)")
         print(f"  └── traces/        (run dirs)")
 
@@ -2675,6 +2764,69 @@ def mcp_trace_open(ref: str | None = "latest", view: str = "trace", cwd: str | N
     return {**resolved, "opened": opened, "error": error}
 
 
+def mcp_trace_read(ref: str | None = "latest", cwd: str | None = None, include_summary: bool = True) -> dict:
+    resolved = mcp_trace_path(ref=ref, view="json", cwd=cwd)
+    trace_json = Path(resolved["path"])
+    doc = json.loads(trace_json.read_text(encoding="utf-8"))
+    payload = {"ref": ref or "latest", "trace_json": str(trace_json), "document": doc}
+    if include_summary:
+        payload["summary"] = _summary_for_path(trace_json)
+    return payload
+
+
+def mcp_trace_clip(
+    ref: str | None = "latest",
+    cwd: str | None = None,
+    start: int | None = None,
+    end: int | None = None,
+    from_pattern: str | None = None,
+    reason: str | None = None,
+    reset: bool = False,
+    session: str | None = None,
+    source: str = "auto",
+    label: str | None = None,
+    note: str | None = None,
+) -> dict:
+    if session:
+        return mcp_trace_create(
+            session=session,
+            cwd=cwd,
+            source=source,
+            label=label,
+            note=note,
+            clip_start=start,
+            clip_end=end,
+            clip_from=from_pattern,
+            clip_reason=reason,
+        )
+
+    db_path = _mcp_db_path(cwd, create=False)
+    tj = _resolve_mcp_ref(ref, db_path)
+    root = load_trace_json(tj)
+    if reset:
+        root.clip = None
+    else:
+        clip = apply_clip_flags(root, clip_start=start, clip_end=end, clip_from=from_pattern, clip_reason=reason)
+        if clip is None:
+            raise SystemExit("no clip flags given")
+    prev_label = prev_note = None
+    if db_path.exists():
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT label, note FROM runs WHERE session_id = ?", (root.session_id,)).fetchone()
+        if row:
+            prev_label, prev_note = row
+    emit_trace_json(root, tj)
+    emit_trace_html(root, tj.parent / "trace.html")
+    track(root, db_path, label=prev_label, note=prev_note, trace_dir=tj.parent)
+    return {
+        "ref": ref or "latest",
+        "trace_json": str(tj),
+        "trace_html": str(tj.parent / "trace.html"),
+        "reset": reset,
+        "summary": _summary_for_path(tj),
+    }
+
+
 def mcp_trace_suggest_improvements(ref: str | None = "latest", cwd: str | None = None) -> dict:
     db_path = _mcp_db_path(cwd, create=False)
     tj = _resolve_mcp_ref(ref, db_path)
@@ -2689,8 +2841,8 @@ def mcp_trace_suggest_improvements(ref: str | None = "latest", cwd: str | None =
 
 
 MCP_TOOLS = {
-    "trace_create": {
-        "description": "Analyze a Claude Code or Codex session, emit trace.json/trace.html, and track it in the project history.",
+    "trace_save": {
+        "description": "Save a Claude Code or Codex session as trace.json/trace.html and track it in project history.",
         "schema": {
             "type": "object",
             "properties": {
@@ -2709,8 +2861,8 @@ MCP_TOOLS = {
         },
         "handler": mcp_trace_create,
     },
-    "trace_history": {
-        "description": "List stored traces for the current project.",
+    "trace_list": {
+        "description": "List stored traces for the current project with metadata such as turns, tokens, models, labels, and artifact paths.",
         "schema": {
             "type": "object",
             "properties": {
@@ -2722,59 +2874,18 @@ MCP_TOOLS = {
         },
         "handler": mcp_trace_history,
     },
-    "trace_compare": {
-        "description": "Compare two stored traces by ref, label, session id, run dir, or trace.json path.",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "baseline": {"type": "string"},
-                "candidate": {"type": "string"},
-                "cwd": {"type": "string"},
-            },
-            "required": ["baseline", "candidate"],
-            "additionalProperties": False,
-        },
-        "handler": mcp_trace_compare,
-    },
-    "trace_progress": {
-        "description": "Compare one trace to previous/best comparable traces and identify progress, regressions, and next improvements.",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "ref": {"type": "string", "default": "latest"},
-                "compare_to": {"type": "string", "enum": ["previous_same_command", "best_same_command", "previous_any"], "default": "previous_same_command"},
-                "baseline": {"type": "string"},
-                "cwd": {"type": "string"},
-                "limit": {"type": "integer", "default": 20},
-            },
-            "additionalProperties": False,
-        },
-        "handler": mcp_trace_progress,
-    },
-    "trace_suggest_improvements": {
-        "description": "Return deterministic optimization suggestions for one stored trace.",
+    "trace_read": {
+        "description": "Read a stored trace.json document for AI inspection.",
         "schema": {
             "type": "object",
             "properties": {
                 "ref": {"type": "string", "default": "latest"},
                 "cwd": {"type": "string"},
+                "include_summary": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
         },
-        "handler": mcp_trace_suggest_improvements,
-    },
-    "trace_path": {
-        "description": "Resolve a stored trace ref to an artifact path.",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "ref": {"type": "string", "default": "latest"},
-                "view": {"type": "string", "enum": ["json", "trace", "html", "ascii", "dir"], "default": "json"},
-                "cwd": {"type": "string"},
-            },
-            "additionalProperties": False,
-        },
-        "handler": mcp_trace_path,
+        "handler": mcp_trace_read,
     },
     "trace_open": {
         "description": "Open a stored trace artifact in the local OS and return its path.",
@@ -2788,6 +2899,27 @@ MCP_TOOLS = {
             "additionalProperties": False,
         },
         "handler": mcp_trace_open,
+    },
+    "trace_clip": {
+        "description": "Clip an existing stored trace in hindsight, or create a clipped trace from a session source.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "default": "latest"},
+                "cwd": {"type": "string"},
+                "start": {"type": "integer"},
+                "end": {"type": "integer"},
+                "from_pattern": {"type": "string"},
+                "reason": {"type": "string"},
+                "reset": {"type": "boolean", "default": False},
+                "session": {"type": "string", "description": "Optional session id or JSONL path to create a new clipped trace."},
+                "source": {"type": "string", "enum": ["auto", "claude", "codex"], "default": "auto"},
+                "label": {"type": "string"},
+                "note": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": mcp_trace_clip,
     },
 }
 
@@ -3070,11 +3202,33 @@ def _find_latest_run_dir(session_id: str, project_root: Path | None = None) -> P
     return None
 
 
+def print_sessions_for_cwd(cwd: str, *, source: str = "auto", limit: int = 20) -> None:
+    """Print raw Claude Code/Codex sessions available to save for a cwd."""
+    matches = find_sessions_for_cwd(cwd, source=source)
+    if not matches:
+        print(f"no sessions for cwd: {cwd}")
+        return
+    seen: set[str] = set()
+    proj_root = find_project_root(cwd)
+    if proj_root is not None:
+        db = project_db_path(proj_root, create=False)
+        if db.exists():
+            conn = sqlite3.connect(db)
+            try:
+                seen = {r[0] for r in conn.execute("SELECT session_id FROM runs")}
+            finally:
+                conn.close()
+    print(f"sessions for {cwd}:")
+    print(f"  {'when':<18}{'source':<8}{'session id':<20}{'command':<22}{'saved':<10}")
+    print("  " + "-" * 78)
+    for s in matches[:limit]:
+        mark = "✓" if s.session_id in seen else ""
+        print(f"  {_format_mtime(s.mtime):<18}{s.source:<8}{s.session_id[:18]:<20}"
+              f"{(s.command or '—'):<22}{mark:<10}")
+
+
 def tracer_version() -> str:
-    try:
-        return package_version(PACKAGE_NAME)
-    except PackageNotFoundError:
-        return __version__
+    return __version__
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -3087,7 +3241,7 @@ def main(argv: list[str]):
     parser.add_argument("--version", action="version", version=f"%(prog)s {tracer_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_an = sub.add_parser("analyze", help="parse session, emit trace.json + trace.html")
+    p_an = sub.add_parser("save", help="create and store trace.json + trace.html for a coding-agent session")
     p_an.add_argument("session", nargs="?", default=None,
                       help="path to JSONL or session id (default: newest session for cwd)")
     p_an.add_argument("--source", default="auto", choices=["auto", "claude", "codex"],
@@ -3112,29 +3266,18 @@ def main(argv: list[str]):
                            '(substring or "tool:Name")')
     p_an.add_argument("--clip-reason", default=None, help="note printed with the clip summary")
 
-    p_tr = sub.add_parser("track", help="record session to SQLite history")
-    p_tr.add_argument("session")
-    p_tr.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
-    p_tr.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
-
-    p_hi = sub.add_parser("history", help="show recorded runs in the current project")
-    p_hi.add_argument("--skill", help='filter by command (e.g. "/ci:run")')
-    p_hi.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
-
-    p_rn = sub.add_parser("render", help="re-render trace.html (and optional ascii) from trace.json")
-    p_rn.add_argument("trace_json", help="path to a trace.json")
-    p_rn.add_argument("--out", default=None,
-                      help="output dir (default: same dir as trace.json)")
-    p_rn.add_argument("--ascii", action="store_true")
-
-    p_ls = sub.add_parser("ls", help="list recent sessions for the current cwd")
+    p_ls = sub.add_parser("ls", help="list saved traces for the current project")
     p_ls.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
-    p_ls.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
     p_ls.add_argument("--limit", type=int, default=20)
+
+    p_sessions = sub.add_parser("sessions", help="list raw Claude Code/Codex sessions available to save")
+    p_sessions.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
+    p_sessions.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
+    p_sessions.add_argument("--limit", type=int, default=20)
 
     sub.add_parser("version", help="print tracer version")
 
-    p_op = sub.add_parser("open", help="open an analyzed run (ref or current cwd's latest)")
+    p_op = sub.add_parser("open", help="open a saved trace run (ref or current cwd's latest)")
     p_op.add_argument("ref", nargs="?", default=None,
                       help="session id, label, run dir, or trace.json path "
                            "(default: latest run for current cwd)")
@@ -3144,22 +3287,12 @@ def main(argv: list[str]):
                       help="which artifact to open")
     p_op.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
-    p_df = sub.add_parser("diff", help="diff two runs (by session id, label, or path)")
-    p_df.add_argument("a", help="ref to baseline run")
-    p_df.add_argument("b", help="ref to compare-against run")
-    p_df.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
-
-    p_cm = sub.add_parser("compare", help="compare recent labeled runs in this project (cheapest first)")
-    p_cm.add_argument("--skill", help='filter by command (e.g. "/ci:run")')
-    p_cm.add_argument("--limit", type=int, default=20)
-    p_cm.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
-
-    p_pa = sub.add_parser("path", help="print absolute path for a ref (default: trace.json)")
-    p_pa.add_argument("ref", help="session id, label, run dir, or trace.json path")
-    p_pa.add_argument("--view", default="json",
-                      choices=["json", "trace", "ascii", "dir"],
-                      help="which artifact's path to print")
-    p_pa.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
+    p_rd = sub.add_parser("read", help="print trace.json for a saved trace ref")
+    p_rd.add_argument("ref", nargs="?", default="latest",
+                      help="session id, label, run dir, trace.json path, or latest")
+    p_rd.add_argument("--cwd", default=None)
+    p_rd.add_argument("--summary", action="store_true", help="print a compact summary instead of full trace.json")
+    p_rd.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
     p_cl = sub.add_parser("clip", help="hard clip an existing trace.json")
     p_cl.add_argument("ref", help="run reference (session id, label, or path)")
@@ -3173,18 +3306,6 @@ def main(argv: list[str]):
     p_cl.add_argument("--reset", action="store_true",
                       help="clear legacy soft-clip metadata; cannot restore hard-clipped turns")
     p_cl.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
-
-    p_in = sub.add_parser("init", help="create .tracer/ in the current project root")
-    p_in.add_argument("--here", action="store_true",
-                      help="initialize in $PWD even if it isn't a git root")
-    p_in.add_argument("--no-gitignore", action="store_true",
-                      help="don't prompt about adding .tracer/traces/ to .gitignore")
-
-    p_mg = sub.add_parser("migrate", help="one-shot: distribute legacy central tracer-db/ into per-project .tracer/")
-    p_mg.add_argument("--from-dir", default=str(LEGACY_TRACER_DB_ROOT),
-                      help="legacy tracer-db root (default: env TRACER_DB_ROOT)")
-    p_mg.add_argument("--dry-run", action="store_true",
-                      help="show what would be moved, don't touch files")
 
     p_mcp = sub.add_parser("mcp", help="serve or install the Tracer MCP server")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
@@ -3210,7 +3331,7 @@ def main(argv: list[str]):
         elif args.mcp_cmd == "remove":
             cmd_mcp_remove(args.scope, args.name)
 
-    elif args.cmd == "analyze":
+    elif args.cmd == "save":
         if args.session:
             path = resolve_input(args.session, source=args.source)
         else:
@@ -3242,10 +3363,10 @@ def main(argv: list[str]):
                   + (f" — reason: {clip.reason}" if clip.reason else "")
                   + (f" — matched: {clip.matched_pattern}" if clip.matched_pattern else ""))
         # Resolve label early so we can put it in the run-dir name.
-        db_path = resolve_db(args.db, for_session=root)
+        db_path = resolve_db(args.db, for_session=root) if (not args.no_track or args.db) else None
         label = args.label
         note = args.note
-        if (label is None or note is None) and db_path.exists():
+        if db_path is not None and (label is None or note is None) and db_path.exists():
             try:
                 conn_l = _ensure_db(db_path)
                 row = conn_l.execute(
@@ -3291,62 +3412,43 @@ def main(argv: list[str]):
             f"{sum(len(s.turns) for s in sessions)} turn(s), "
             f"cost-weighted {root.total_cost:,.0f} tok"
         )
-        if not args.no_track:
+        if not args.no_track and db_path is not None:
             track(root, db_path, label=label, note=note, trace_dir=out_dir)
-
-    elif args.cmd == "track":
-        path = resolve_input(args.session, source=args.source)
-        sess = parse_session(path)
-        track(sess, resolve_db(args.db, for_session=sess))
-
-    elif args.cmd == "history":
-        history(resolve_db(args.db), skill=args.skill)
-
-    elif args.cmd == "render":
-        tj = Path(args.trace_json).expanduser().resolve()
-        root = load_trace_json(tj)
-        out_dir = Path(args.out).expanduser().resolve() if args.out else tj.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        emit_trace_html(root, out_dir / "trace.html")
-        if args.ascii:
-            emit_ascii(root, out_dir / "ascii.txt")
-        print(f"rendered from {tj.name} → {out_dir}")
 
     elif args.cmd == "ls":
         cwd = args.cwd or os.getcwd()
-        matches = find_sessions_for_cwd(cwd, source=args.source)
-        if not matches:
-            print(f"no sessions for cwd: {cwd}")
+        db = project_db_path(active_project_root(cwd), create=False)
+        rows = _run_rows(db, limit=args.limit)
+        if not rows:
+            print(f"no saved traces for project: {active_project_root(cwd, error_if_missing=False) or cwd}")
             return
-        # Check which sessions are already analyzed in this project's tracker.
-        seen: set[str] = set()
-        proj_root = find_project_root(cwd)
-        if proj_root is not None:
-            db = project_db_path(proj_root, create=False)
-            if db.exists():
-                conn = sqlite3.connect(db)
-                seen = {r[0] for r in conn.execute("SELECT session_id FROM runs")}
-        print(f"sessions for {cwd}:")
-        print(f"  {'when':<18}{'source':<8}{'session id':<20}{'command':<22}{'analyzed':<10}")
-        print("  " + "-" * 78)
-        for s in matches[: args.limit]:
-            mark = "✓" if s.session_id in seen else ""
-            print(f"  {_format_mtime(s.mtime):<18}{s.source:<8}{s.session_id[:18]:<20}"
-                  f"{(s.command or '—'):<22}{mark:<10}")
+        print(f"saved traces for {active_project_root(cwd)}:")
+        print(f"  {'when':<18}{'label':<22}{'turns':>5} {'tokens':>10} {'model':<13} path")
+        print("  " + "-" * 96)
+        for row in rows:
+            summary = _summary_for_path(Path(row["trace_json"])) if row.get("trace_json") else {}
+            print(
+                f"  {(row.get('started_at') or '')[:16]:<18}"
+                f"{(row.get('label') or row.get('session_id') or '')[:21]:<22}"
+                f"{summary.get('turns') or 0:>5} "
+                f"{int(summary.get('cost_weighted') or 0):>10,} "
+                f"{_shorten_model(_dominant_model(summary.get('model_mix') or {})):<13} "
+                f"{row.get('trace_json') or ''}"
+            )
+
+    elif args.cmd == "sessions":
+        cwd = args.cwd or os.getcwd()
+        print_sessions_for_cwd(cwd, source=args.source, limit=args.limit)
 
     elif args.cmd == "version":
         print(tracer_version())
 
-    elif args.cmd == "path":
+    elif args.cmd == "read":
         tj = _resolve_run_target(args.ref, resolve_db(args.db))
-        run_dir = tj.parent
-        targets = {
-            "json": tj,
-            "trace": run_dir / "trace.html",
-            "ascii": run_dir / "ascii.txt",
-            "dir": run_dir,
-        }
-        print(targets[args.view])
+        if args.summary:
+            print(json.dumps(_summary_for_path(tj), ensure_ascii=False, indent=2))
+        else:
+            print(tj.read_text(encoding="utf-8"))
 
     elif args.cmd == "clip":
         db_path = resolve_db(args.db)
@@ -3387,18 +3489,6 @@ def main(argv: list[str]):
         track(root, db_path, label=prev_label, note=prev_note, trace_dir=out_dir)
         print(f"re-rendered views in {out_dir}")
 
-    elif args.cmd == "init":
-        cmd_init(here=args.here, skip_gitignore_prompt=args.no_gitignore)
-
-    elif args.cmd == "migrate":
-        cmd_migrate(Path(args.from_dir).expanduser(), dry_run=args.dry_run)
-
-    elif args.cmd == "diff":
-        diff_runs(args.a, args.b, resolve_db(args.db))
-
-    elif args.cmd == "compare":
-        compare_runs(resolve_db(args.db), args.skill, args.limit)
-
     elif args.cmd == "open":
         import subprocess
         if args.ref:
@@ -3412,8 +3502,8 @@ def main(argv: list[str]):
             run_dir = _find_latest_run_dir(matches[0].session_id)
             if run_dir is None:
                 raise SystemExit(
-                    f"session {matches[0].session_id} not yet analyzed — "
-                    f"run `tracer analyze` first"
+                    f"session {matches[0].session_id} not yet saved — "
+                    f"run `tracer save` first"
                 )
         target_map = {
             "trace": run_dir / "trace.html",

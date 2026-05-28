@@ -1,12 +1,22 @@
 # Tracer
 
-Tracer analyzes Claude Code and Codex session logs and turns them into stored trace artifacts:
+Tracer turns coding-agent sessions into durable traces you can save, open, and read.
 
-- `trace.json` as the canonical machine-readable trace
-- `trace.html` as a chronological browser view
-- `.tracer/runs.db` as per-project history for comparing runs over time
+Use it when Claude Code, Codex, or another coding agent says a task is done and you need a stable artifact of what actually happened: prompts, tool calls, evidence, test output, and cost/context shape.
 
-It can be used as a CLI or as a local MCP server for Claude Code.
+Tracer Core is intentionally small:
+
+- `tracer save` creates `trace.json` and `trace.html` artifacts.
+- `tracer ls` lists saved traces with useful metadata.
+- `tracer sessions` lists raw Claude Code and Codex sessions available to save.
+- `tracer open` opens the human-readable `trace.html`.
+- `tracer read` prints the machine-readable `trace.json` for agents.
+- `tracer clip` trims traces after creation.
+
+Tracer Lab is the bundled experimental review/error-analysis tool:
+
+- `tracer-lab open` imports traces and opens the local review surface.
+- `tracer-lab mcp serve` exposes annotations, suggestions, and failure-mode clustering to agents.
 
 ## Install
 
@@ -15,7 +25,8 @@ Recommended install from GitHub:
 ```bash
 pipx install "git+https://github.com/alextacho/tracer.git"
 ```
-or
+
+or:
 
 ```bash
 pip install "git+https://github.com/alextacho/tracer.git"
@@ -28,69 +39,79 @@ tracer --help
 tracer version
 ```
 
-If every user installs `tracer` on `PATH`, a shared project MCP config can use:
-
-```json
-{
-  "mcpServers": {
-    "tracer": {
-      "type": "stdio",
-      "command": "tracer",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
-```
-
-Because the package installs a console script named `tracer`, the MCP command stays stable as `tracer mcp serve`.
-
-## Project Setup
+## Quickstart
 
 From a project you want to trace:
 
 ```bash
-tracer init
+tracer ls
+tracer save --label baseline --note "first reviewable run"
+tracer open baseline
 ```
 
-This creates:
+This creates project-local storage:
 
 ```text
 .tracer/
   runs.db
   traces/
+    <run>/
+      trace.json
+      trace.html
+      ascii.txt
 ```
 
-Trace artifacts can be large, so `tracer init` can add `.tracer/traces/` to `.gitignore`.
+`trace.json` is the source of truth. `trace.html` is the chronological browser view.
 
-## CLI Usage
+## Sample
 
-List recent Claude Code and Codex sessions for the current directory:
+From a source checkout, run Tracer against the included public sample session:
+
+```bash
+tracer save examples/codex-smoke-session.jsonl \
+  --source codex \
+  --out /tmp/tracer-sample \
+  --no-track \
+  --label sample \
+  --ascii
+tracer read /tmp/tracer-sample/trace.json --summary
+```
+
+The same generated `trace.json` can be opened in Lab:
+
+```bash
+tracer-lab open /tmp/tracer-sample/trace.json
+```
+
+## CLI
+
+List saved traces for the current project:
 
 ```bash
 tracer ls
-tracer ls --source codex
 ```
 
-Analyze the latest session for the current directory:
+List recent raw Claude Code and Codex sessions for the current directory:
 
 ```bash
-tracer analyze --label "my-experiment" --note "What changed in this attempt"
+tracer sessions
+tracer sessions --source codex
 ```
 
-Analyze a specific session:
+Save the latest session as trace artifacts:
 
 ```bash
-tracer analyze <session-id-or-jsonl-path> --label "baseline"
-tracer analyze --source codex --label "codex-run"
+tracer save --label "my-experiment" --note "What changed in this attempt"
 ```
 
-Open the latest analyzed trace:
+Save a specific session:
 
 ```bash
-tracer open
+tracer save <session-id-or-jsonl-path> --label baseline
+tracer save --source codex --label codex-run
 ```
 
-Open a specific artifact:
+Open saved artifacts:
 
 ```bash
 tracer open baseline --view trace
@@ -98,33 +119,14 @@ tracer open baseline --view json
 tracer open baseline --view dir
 ```
 
-Show stored history:
+Read the trace JSON for an agent or script:
 
 ```bash
-tracer history
+tracer read baseline
+tracer read baseline --summary
 ```
 
-Compare two stored runs:
-
-```bash
-tracer diff baseline candidate
-```
-
-Rank recent runs by cost:
-
-```bash
-tracer compare
-```
-
-Resolve artifact paths:
-
-```bash
-tracer path baseline --view json
-tracer path baseline --view trace
-tracer path baseline --view dir
-```
-
-Hard clip irrelevant setup or trailing turns out of an existing trace:
+Clip irrelevant setup or trailing turns after a trace has been created:
 
 ```bash
 tracer clip baseline --start 3 --reason "ignore initial setup"
@@ -132,45 +134,66 @@ tracer clip baseline --from "tool:Edit" --reason "start at implementation"
 tracer clip baseline --reset
 ```
 
-Clipping rewrites the trace to keep only the selected root turns. `--from`
-uses the most recent matching turn, so repeated text anchors clip from the
-latest occurrence. Subagent output attached to kept turns is preserved.
+Clipping rewrites the trace to keep only the selected root turns. `--from` uses the most recent matching turn, so repeated text anchors clip from the latest occurrence. Subagent output attached to kept turns is preserved.
 
-Tool results inside the retained clip are stored fully in `trace.json`.
-`trace.html` shows compact previews by default and exposes full results on
-demand, so the JSON artifact remains faithful even if the original Claude
-JSONL logs or files read during the session are later removed or changed.
+Tool results inside the retained clip are stored fully in `trace.json`. `trace.html` shows compact previews by default and exposes full results on demand, so the JSON artifact remains faithful even if the original logs or files read during the session are later removed or changed.
 
-## MCP Server
+## Lab
 
-Tracer includes a stdio MCP server for Claude Code.
+Tracer Lab is the bundled experimental local review and error-analysis surface. It imports saved traces and lets humans or agents create:
 
-Start it manually:
+- notes
+- labels
+- pending suggestions
+- failure observations
+- failure-mode clusters
+- eval candidate exports
+
+Agent-authored suggestions are pending until a human accepts, edits, or rejects them.
+
+Run it separately from Tracer Core:
+
+```bash
+tracer-lab open
+tracer-lab open /path/to/trace.json
+```
+
+Lab review state is stored at:
+
+```text
+.tracer/lab.db
+```
+
+## MCP Servers
+
+Each tool has its own MCP server.
+
+Tracer Core MCP:
 
 ```bash
 tracer mcp serve
 ```
 
-Normally you do not run this by hand. Claude Code starts it after installation.
+Tracer Lab MCP:
 
-## Install MCP In Claude Code
+```bash
+tracer-lab mcp serve
+```
 
-Install for the current Claude Code project/session:
+Install Tracer Core into Claude Code:
 
 ```bash
 tracer mcp install --scope local
-```
-
-Install for your user:
-
-```bash
 tracer mcp install --scope user
+tracer mcp install --scope project
 ```
 
-Install into project MCP config:
+Install Tracer Lab into Claude Code:
 
 ```bash
-tracer mcp install --scope project
+tracer-lab mcp install --scope local
+tracer-lab mcp install --scope user
+tracer-lab mcp install --scope project
 ```
 
 Then verify in Claude Code:
@@ -186,90 +209,47 @@ tracer mcp status
 tracer mcp remove
 ```
 
-## MCP Tools
+## Core MCP Tools
 
-The MCP server exposes these tools to Claude Code:
+`tracer mcp serve` exposes only core trace storage and access:
 
-- `trace_create`: analyze a Claude Code session, emit `trace.json` and `trace.html`, and store it in history
-- `trace_history`: list stored traces for the current project
-- `trace_compare`: compare two stored traces by label, session id, run dir, or `trace.json` path
-- `trace_progress`: compare one trace against a previous or best comparable trace and summarize progress/regressions
-- `trace_suggest_improvements`: return optimization suggestions for a stored trace
-- `trace_path`: resolve a stored trace reference to an artifact path
-- `trace_open`: open a stored trace artifact with the local OS
+- `trace_save`: create/store trace artifacts.
+- `trace_list`: list saved traces and metadata.
+- `trace_read`: read a stored `trace.json`.
+- `trace_open`: open a stored trace artifact with the local OS.
+- `trace_clip`: clip an existing stored trace or create a clipped trace from a session source.
 
-Example Claude Code requests after MCP is connected:
+## Lab MCP Tools
 
-```text
-Use tracer to create a trace for the latest session and summarize it.
-```
+`tracer-lab mcp serve` exposes review and analysis workflows:
 
-```text
-Use tracer to compare the latest trace against the previous same-command trace.
-```
+- `tracer_lab_open`: open Lab for a project or trace.
+- `tracer_lab_list_traces`: list imported/discovered traces.
+- `tracer_lab_get_trace`: get trace metadata, annotations, and optionally raw `trace.json`.
+- `tracer_lab_create_suggestion`: create an agent-authored pending note, label, or failure suggestion.
+- `tracer_lab_list_failure_modes`: list failure modes.
+- `tracer_lab_failure_mode_workspace`: list reviewed failures and cluster state.
+- `tracer_lab_create_failure_mode`: create a failure-mode cluster.
+- `tracer_lab_update_failure_mode`: update a failure-mode cluster.
+- `tracer_lab_assign_failure`: assign or unassign reviewed failure annotations.
+- `tracer_lab_export_eval_candidates`: export failure-mode support data.
 
-```text
-Use tracer to open the latest trace HTML.
-```
-
-## MCP Tool Inputs
-
-Common references accepted by MCP tools:
-
-- a session id or session id prefix
-- a stored label
-- a run directory
-- a direct `trace.json` path
-- `latest`
-
-`trace_create` accepts:
-
-```json
-{
-  "session": "optional session id or JSONL path",
-  "cwd": "optional project cwd",
-  "label": "short label",
-  "note": "what changed",
-  "clip_start": 3,
-  "clip_end": 1,
-  "clip_from": "tool:Edit",
-  "clip_reason": "ignore setup",
-  "emit_ascii_artifact": false
-}
-```
-
-`clip_from` starts at the most recent matching root turn. Clip options hard
-trim the emitted trace rather than hiding excluded turns.
-
-`trace_open` accepts:
-
-```json
-{
-  "ref": "latest",
-  "view": "trace"
-}
-```
-
-`view` can be `trace`, `json`, `ascii`, or `dir`.
-
-## Storage Model
-
-Tracer stores history per project:
+Example agent requests after MCP is connected:
 
 ```text
-<project>/.tracer/
-  runs.db
-  traces/
-    <timestamp>__<session-prefix>__<label>/
-      trace.json
-      trace.html
-      ascii.txt
+Use tracer to save the latest session and read the resulting trace JSON.
 ```
 
-The SQLite database stores run metadata and paths. The trace directory stores the detailed artifacts.
+```text
+Use tracer-lab to review the latest trace and add pending suggestions for evidence gaps.
+```
+
+```text
+Use tracer to clip the latest trace from the first Edit tool call, then reopen it in Lab.
+```
 
 ## Notes
 
 - Tracer reads Claude Code logs from `~/.claude/projects` and Codex rollout logs from `~/.codex/sessions`.
-- `trace.json` is the source of truth, including full retained tool results; `trace.html` can be regenerated with `tracer render`.
-- MCP `trace_open` uses macOS `open`. In headless environments it may return the path without successfully opening the artifact.
+- `trace.json` is the source of truth and includes full retained tool results.
+- MCP `trace_open` uses macOS `open`; in headless environments it may return the path without successfully opening the artifact.
