@@ -75,6 +75,7 @@ class PublicCliTests(unittest.TestCase):
 
             session = make_session()
             session.cwd = str(project)
+            session.first_user_prompt = "session-1234567890 prompt"
             session.turns.append(core.Turn(
                 request_id="req-2",
                 timestamp="2026-05-19T10:01:00Z",
@@ -94,6 +95,38 @@ class PublicCliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("sample", output)
         self.assertIn("    2 ", output)
+        self.assertIn("tokens", output)
+        self.assertIn("prompt", output)
+        self.assertIn("session-1234567890", output)
+        self.assertIn("6", output)
+
+    def test_claude_session_display_details_are_fast_identifiers(self):
+        rows = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-19T10:00:00Z",
+                "cwd": "/tmp/project",
+                "message": {"content": "please review this pull request"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-19T10:02:03Z",
+                "requestId": "req-1",
+                "message": {
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [{"type": "text", "text": "done"}],
+                },
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td, "session.jsonl")
+            path.write_text("\n".join(json.dumps(r) for r in rows))
+            prompt, duration = core._raw_session_display_details(path, "claude")
+
+        self.assertEqual(prompt, "please review this pull request")
+        self.assertEqual(duration, 123)
 
     def test_config_set_writes_project_config(self):
         with tempfile.TemporaryDirectory() as td:
@@ -238,6 +271,93 @@ class SessionDiscoveryTests(unittest.TestCase):
         self.assertEqual(resolved, session_path)
 
 
+class CostDisplayTests(unittest.TestCase):
+    def test_opus_4_8_is_priced(self):
+        dollars = core.dollars_for(
+            "claude-opus-4-8",
+            input_tokens=52_685,
+            cache_creation=417_664,
+            cache_read=1_321_032,
+            output_tokens=35_569,
+        )
+
+        self.assertIsNotNone(dollars)
+        self.assertAlmostEqual(dollars or 0, 13.270698)
+
+    def test_trace_html_shows_total_raw_tokens(self):
+        session = make_session()
+        session.turns[0].input_tokens = 10
+        session.turns[0].cache_creation = 20
+        session.turns[0].cache_read = 30
+        session.turns[0].output_tokens = 40
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_html = Path(td, "trace.html")
+            core.emit_trace_html(session, trace_html)
+            html = trace_html.read_text()
+
+        self.assertIn("<b>tokens:</b>", html)
+        self.assertIn('<span class="num">100</span>', html)
+
+    def test_turn_timeline_timestamp_uses_earliest_user_event(self):
+        turn = core.Turn(
+            request_id="req-1",
+            timestamp="2026-05-19T10:00:02Z",
+            input_tokens=1,
+            output_tokens=1,
+        )
+        turn.events.append(core.UserMessage(
+            id="req-1:user:0",
+            text="prompt",
+            timestamp="2026-05-19T10:00:01Z",
+        ))
+
+        self.assertEqual(core._turn_timeline_timestamp(turn), "2026-05-19T10:00:01Z")
+
+    def test_trace_json_includes_pricing_breakdown_metadata(self):
+        session = make_session()
+        session.turns[0].model = "claude-opus-4-8"
+        session.turns[0].input_tokens = 52_685
+        session.turns[0].cache_creation = 417_664
+        session.turns[0].cache_read = 1_321_032
+        session.turns[0].output_tokens = 35_569
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_json = Path(td, "trace.json")
+            core.emit_trace_json(session, trace_json)
+            doc = json.loads(trace_json.read_text())
+
+        pricing = doc["task"]["totals"]["pricing"]
+        self.assertEqual(pricing["rows"][0]["model"], "claude-opus-4-8")
+        self.assertEqual(pricing["rows"][0]["label"], "Opus 4.8")
+        self.assertEqual(pricing["rows"][0]["input"], 52_685)
+        self.assertEqual(pricing["rows"][0]["output"], 35_569)
+        self.assertEqual(pricing["rows"][0]["cache_creation"], 417_664)
+        self.assertEqual(pricing["rows"][0]["cache_read"], 1_321_032)
+        self.assertAlmostEqual(pricing["rows"][0]["dollars"], 13.270698)
+        self.assertEqual(pricing["total"]["tokens"], 1_826_950)
+
+    def test_trace_html_includes_pricing_breakdown_table(self):
+        session = make_session()
+        session.turns[0].model = "claude-opus-4-8"
+        session.turns[0].input_tokens = 52_685
+        session.turns[0].cache_creation = 417_664
+        session.turns[0].cache_read = 1_321_032
+        session.turns[0].output_tokens = 35_569
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_html = Path(td, "trace.html")
+            core.emit_trace_html(session, trace_html)
+            html = trace_html.read_text()
+
+        self.assertIn('class="pricing-table"', html)
+        self.assertIn("<th>Model</th><th>Input</th><th>Output</th>", html)
+        self.assertIn("Opus 4.8", html)
+        self.assertIn("52,685", html)
+        self.assertIn("417,664", html)
+        self.assertIn("$13.27", html)
+
+
 class TraceJsonTests(unittest.TestCase):
     def test_tool_result_content_round_trips(self):
         full = "0123456789" * 400
@@ -376,6 +496,87 @@ class ClaudeParserTests(unittest.TestCase):
         self.assertEqual(session.first_user_prompt, "first prompt")
         self.assertEqual([t.user_messages for t in session.turns], [["first prompt"], ["second prompt"]])
         self.assertEqual([t.text_blocks for t in session.turns], [["first answer"], ["second answer"]])
+
+    def test_subagents_link_by_tool_use_id_not_file_mtime(self):
+        main_rows = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-19T10:00:00Z",
+                "requestId": "req-main",
+                "message": {
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-first",
+                            "name": "Agent",
+                            "input": {"description": "first", "subagent_type": "general-purpose"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-second",
+                            "name": "Agent",
+                            "input": {"description": "second", "subagent_type": "general-purpose"},
+                        },
+                    ],
+                },
+            },
+        ]
+
+        def sub_rows(prompt: str) -> list[dict]:
+            return [
+                {
+                    "type": "user",
+                    "timestamp": "2026-05-19T10:00:01Z",
+                    "cwd": "/tmp/project",
+                    "message": {"content": prompt},
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-05-19T10:00:02Z",
+                    "requestId": f"req-{prompt}",
+                    "message": {
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "content": [{"type": "text", "text": f"answer {prompt}"}],
+                    },
+                },
+            ]
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            main_path = root / "session-main.jsonl"
+            main_path.write_text("\n".join(json.dumps(r) for r in main_rows))
+            sub_dir = root / "session-main" / "subagents"
+            sub_dir.mkdir(parents=True)
+
+            first_path = sub_dir / "agent-first.jsonl"
+            second_path = sub_dir / "agent-second.jsonl"
+            first_path.write_text("\n".join(json.dumps(r) for r in sub_rows("first prompt")))
+            second_path.write_text("\n".join(json.dumps(r) for r in sub_rows("second prompt")))
+            (sub_dir / "agent-first.meta.json").write_text(json.dumps({
+                "agentType": "general-purpose",
+                "description": "first",
+                "toolUseId": "toolu-first",
+            }))
+            (sub_dir / "agent-second.meta.json").write_text(json.dumps({
+                "agentType": "general-purpose",
+                "description": "second",
+                "toolUseId": "toolu-second",
+            }))
+
+            # Deliberately make mtime order disagree with spawn order.
+            os.utime(second_path, (1, 1))
+            os.utime(first_path, (2, 2))
+
+            session = core.parse_session(main_path)
+
+        calls = session.turns[0].tool_calls
+        self.assertEqual(calls[0].tool_use_id, "toolu-first")
+        self.assertEqual(calls[0].child_session.first_user_prompt, "first prompt")
+        self.assertEqual(calls[1].tool_use_id, "toolu-second")
+        self.assertEqual(calls[1].child_session.first_user_prompt, "second prompt")
 
 
 class CodexParserTests(unittest.TestCase):

@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -305,6 +305,7 @@ def cost_weighted(in_tok: int, cc: int, cr: int, out: int) -> float:
 # Cache writes default to 5m (most common). Override via ~/.config/tracer/pricing.json.
 MODEL_PRICING_DEFAULT: dict[str, tuple[float, float, float, float, float]] = {
     # Opus family
+    "claude-opus-4-8":  (15.0, 75.0, 18.75, 30.0, 1.50),
     "claude-opus-4-7":  (15.0, 75.0, 18.75, 30.0, 1.50),
     "claude-opus-4-6":  (15.0, 75.0, 18.75, 30.0, 1.50),
     "claude-opus-4":    (15.0, 75.0, 18.75, 30.0, 1.50),
@@ -357,6 +358,19 @@ def dollars_for(
         + cache_read * cr_r
         + output_tokens * out_r
     ) / 1_000_000
+
+
+def _model_display_name(model: str) -> str:
+    s = model or "(unknown)"
+    if s.startswith("claude-opus-"):
+        return "Opus " + s[len("claude-opus-"):].replace("-", ".")
+    if s.startswith("claude-sonnet-"):
+        return "Sonnet"
+    if s.startswith("claude-haiku-"):
+        return "Haiku"
+    if s.startswith("claude-"):
+        return s[len("claude-"):].replace("-", " ").title()
+    return s
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -810,20 +824,45 @@ def parse_claude_session(path: Path) -> Session:
         source="claude",
     )
 
-    # Link subagents: each Agent tool_use should have a corresponding JSONL in
-    # <session-dir>/subagents/. We match by order of appearance.
+    # Link subagents. Claude writes <agent>.meta.json files with the parent
+    # Agent toolUseId; use that stable ID because parallel subagents can finish
+    # in an order unrelated to their spawn order.
     sub_dir = path.parent / session_id / "subagents"
     if sub_dir.exists():
-        # Read meta.json for each agent file to know its agentType.
-        sub_files: list[Path] = sorted(sub_dir.glob("agent-*.jsonl"))
-        # Build queue of Agent tool calls in this session, in temporal order.
+        subagent_by_tool_id: dict[str, Path] = {}
+        for meta_path in sorted(sub_dir.glob("agent-*.meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception as e:
+                print(f"warning: failed to read subagent metadata {meta_path}: {e}", file=sys.stderr)
+                continue
+            tool_id = meta.get("toolUseId")
+            sub_path = Path(str(meta_path)[:-len(".meta.json")] + ".jsonl")
+            if isinstance(tool_id, str) and tool_id and sub_path.exists():
+                subagent_by_tool_id[tool_id] = sub_path
+
         agent_calls: list[ToolCall] = [
             tc for turn in turns for tc in turn.tool_calls if tc.name == "Agent"
         ]
-        # Match: subagent files are listed alphabetically; we re-sort by mtime
-        # to match temporal order more reliably.
-        sub_files.sort(key=lambda p: p.stat().st_mtime)
-        for tc, sub_path in zip(agent_calls, sub_files):
+        matched_paths: set[Path] = set()
+        unmatched_calls: list[ToolCall] = []
+        for tc in agent_calls:
+            sub_path = subagent_by_tool_id.get(tc.tool_use_id)
+            if sub_path is None:
+                unmatched_calls.append(tc)
+                continue
+            try:
+                tc.child_session = parse_claude_session(sub_path)
+                matched_paths.add(sub_path)
+            except Exception as e:
+                print(f"warning: failed to parse subagent {sub_path}: {e}", file=sys.stderr)
+
+        # Fallback for older transcripts without toolUseId metadata.
+        fallback_files = [
+            p for p in sorted(sub_dir.glob("agent-*.jsonl"), key=lambda p: p.stat().st_mtime)
+            if p not in matched_paths
+        ]
+        for tc, sub_path in zip(unmatched_calls, fallback_files):
             try:
                 tc.child_session = parse_claude_session(sub_path)
             except Exception as e:
@@ -1237,6 +1276,36 @@ def _rel_seconds(ts: str, origin: datetime | None) -> str:
         return ""
 
 
+def _parse_timestamp(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _turn_timeline_timestamp(turn: Turn) -> str:
+    """Earliest timestamp represented inside this turn.
+
+    Claude records the first assistant message timestamp as the turn timestamp,
+    while the user message that prompted the turn can be slightly earlier. Use
+    the earliest event timestamp for timeline dividers so rows do not appear to
+    move backward within a turn.
+    """
+    candidates = [turn.timestamp]
+    for e in turn.events:
+        if isinstance(e, UserMessage) and e.timestamp:
+            candidates.append(e.timestamp)
+        elif isinstance(e, ToolCall) and e.timestamp:
+            candidates.append(e.timestamp)
+    parsed = [(ts, _parse_timestamp(ts)) for ts in candidates if ts]
+    parsed = [(ts, dt) for ts, dt in parsed if dt is not None]
+    if not parsed:
+        return turn.timestamp
+    return min(parsed, key=lambda item: item[1])[0]
+
+
 def _input_pretty(name: str, inp: dict) -> str:
     """Render tool input details for the trace expansion panel."""
     if not isinstance(inp, dict) or not inp:
@@ -1288,6 +1357,18 @@ TRACE_HTML_HEAD = r"""<!DOCTYPE html>
     padding: 10px 14px; margin-bottom: 14px; }
   .topbar span { display: inline-block; margin-right: 18px; }
   .num { font-variant-numeric: tabular-nums; }
+  .pricing-table { width: 100%; border-collapse: collapse; background: #fff;
+    border: 1px solid var(--rule); border-radius: 6px; overflow: hidden;
+    margin: 0 0 14px 0; font-variant-numeric: tabular-nums; }
+  .pricing-table th, .pricing-table td { padding: 6px 10px; border-bottom: 1px solid var(--rule);
+    text-align: right; white-space: nowrap; }
+  .pricing-table th:first-child, .pricing-table td:first-child { text-align: left; }
+  .pricing-table thead th { background: #f6f5ef; font-size: 12px; color: #555; }
+  .pricing-table tbody th { font-weight: 600; }
+  .pricing-table tr:last-child th, .pricing-table tr:last-child td { border-bottom: 0; }
+  .pricing-table .pricing-total th, .pricing-table .pricing-total td {
+    background: #fcfcf8; font-weight: 700;
+  }
   .controls { margin: 8px 0; }
   .controls button { font: inherit; padding: 4px 10px; margin-right: 6px;
     border: 1px solid var(--rule); background: #fff; border-radius: 4px; cursor: pointer; }
@@ -1360,12 +1441,14 @@ TRACE_HTML_HEAD = r"""<!DOCTYPE html>
 <h1>Trace — <code>__NAME__</code></h1>
 <div class="topbar">
   <span><b>cost-weighted:</b> <span class="num">__TOTAL_COST__</span></span>
+  <span><b>tokens:</b> <span class="num">__TOTAL_TOKENS__</span></span>
   <span><b>dollars:</b> <span class="num">__TOTAL_DOLLARS__</span></span>
   <span><b>model:</b> <span class="num">__MODEL_MIX__</span></span>
   <span><b>sessions:</b> __N_SESSIONS__</span>
   <span><b>turns:</b> __N_TURNS__</span>
   <span><b>wall:</b> __WALL__</span>
 </div>
+__PRICING_TABLE__
 <div class="controls">
   <button onclick="document.querySelectorAll('.trace details').forEach(d=>d.open=true)">Expand all</button>
   <button onclick="document.querySelectorAll('.trace details').forEach(d=>d.open=false)">Collapse all</button>
@@ -1424,6 +1507,29 @@ def _short_num(n: float | int) -> str:
     return f"{n:.0f}"
 
 
+def _one_line(text: str, limit: int) -> str:
+    s = re.sub(r"\s+", " ", text or "").strip()
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "—"
+    try:
+        total = int(float(seconds))
+    except Exception:
+        return "—"
+    if total < 0:
+        return "—"
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
 def _expanded_turn_totals(turn: Turn) -> tuple[int, int, float]:
     """Tokens billed for this turn + any subagents spawned in it."""
     in_tok = turn.billable_input
@@ -1435,6 +1541,113 @@ def _expanded_turn_totals(turn: Turn) -> tuple[int, int, float]:
             out_tok += tc.child_session.total_output
             cost += tc.child_session.total_cost
     return in_tok, out_tok, cost
+
+
+def pricing_breakdown(root: Session) -> dict:
+    by_model: dict[str, dict] = {}
+    total = {
+        "model": "total",
+        "label": "Total",
+        "turns": 0,
+        "input": 0,
+        "output": 0,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "tokens": 0,
+        "cost_weighted": 0.0,
+        "dollars": 0.0,
+        "unpriced_turns": 0,
+    }
+    for session in root.all_sessions():
+        for turn in session.included_turns:
+            key = turn.model or "(unknown)"
+            row = by_model.setdefault(key, {
+                "model": key,
+                "label": _model_display_name(key),
+                "turns": 0,
+                "input": 0,
+                "output": 0,
+                "cache_creation": 0,
+                "cache_read": 0,
+                "tokens": 0,
+                "cost_weighted": 0.0,
+                "dollars": 0.0,
+                "unpriced_turns": 0,
+            })
+            dollars = turn.dollars
+            for target in (row, total):
+                target["turns"] += 1
+                target["input"] += turn.input_tokens
+                target["output"] += turn.output_tokens
+                target["cache_creation"] += turn.cache_creation
+                target["cache_read"] += turn.cache_read
+                target["tokens"] += (
+                    turn.input_tokens
+                    + turn.output_tokens
+                    + turn.cache_creation
+                    + turn.cache_read
+                )
+                target["cost_weighted"] += turn.cost
+                if dollars is None:
+                    target["unpriced_turns"] += 1
+                else:
+                    target["dollars"] += dollars
+
+    rows = sorted(
+        by_model.values(),
+        key=lambda r: (r["dollars"], r["cost_weighted"], r["tokens"]),
+        reverse=True,
+    )
+    return {"rows": rows, "total": total}
+
+
+def _pricing_breakdown_html(breakdown: dict) -> str:
+    rows = list(breakdown.get("rows") or [])
+    total = breakdown.get("total") or {}
+    if not rows and not total:
+        return ""
+
+    def money(row: dict, approx: bool = False) -> str:
+        dollars = float(row.get("dollars") or 0.0)
+        text = f"${dollars:,.2f}" if dollars else "—"
+        if approx and dollars:
+            text = "≈ " + text
+        unpriced = int(row.get("unpriced_turns") or 0)
+        if unpriced:
+            text += f" ({unpriced} unpriced)"
+        return text
+
+    body_rows = []
+    for row in rows:
+        body_rows.append(
+            "<tr>"
+            f"<th scope=\"row\">{_esc(str(row.get('label') or row.get('model') or '—'))}</th>"
+            f"<td>{_fmt_num(int(row.get('input') or 0))}</td>"
+            f"<td>{_fmt_num(int(row.get('output') or 0))}</td>"
+            f"<td>{_fmt_num(int(row.get('cache_creation') or 0))}</td>"
+            f"<td>{_fmt_num(int(row.get('cache_read') or 0))}</td>"
+            f"<td>{_esc(money(row))}</td>"
+            "</tr>"
+        )
+    body_rows.append(
+        "<tr class=\"pricing-total\">"
+        "<th scope=\"row\">Total</th>"
+        f"<td>{_fmt_num(int(total.get('input') or 0))}</td>"
+        f"<td>{_fmt_num(int(total.get('output') or 0))}</td>"
+        f"<td>{_fmt_num(int(total.get('cache_creation') or 0))}</td>"
+        f"<td>{_fmt_num(int(total.get('cache_read') or 0))}</td>"
+        f"<td>{_esc(money(total, approx=True))}</td>"
+        "</tr>"
+    )
+    return (
+        '<table class="pricing-table">'
+        "<thead><tr>"
+        "<th>Model</th><th>Input</th><th>Output</th>"
+        "<th>Cache write</th><th>Cache read</th><th>Cost</th>"
+        "</tr></thead><tbody>"
+        + "".join(body_rows)
+        + "</tbody></table>"
+    )
 
 
 def _text_followup_costs(sess: Session) -> dict[tuple[int, int], tuple[int, int, float]]:
@@ -1485,9 +1698,10 @@ def _trace_rows(sess: Session, depth: int, origin: datetime | None) -> list[str]
         if td is not None:
             turn_meta_bits.append(f"${td:.4f}" if td < 0.01 else f"${td:.3f}")
         turn_meta = " · ".join(turn_meta_bits)
+        turn_ts = _turn_timeline_timestamp(turn)
         # Turn divider
         rows.append(_emit_row(
-            _rel_seconds(turn.timestamp, origin),
+            _rel_seconds(turn_ts, origin),
             "·",
             f'<span class="turn-marker">── turn {ti+1}'
             + (' [CLIPPED]' if is_clipped else '')
@@ -1655,13 +1869,10 @@ def _clip_banner_html(root: Session) -> str:
 
 
 def emit_trace_html(root: Session, out_path: Path):
-    # Origin = first turn timestamp of root
+    # Origin = earliest event timestamp in the first root turn.
     origin = None
     if root.turns:
-        try:
-            origin = datetime.fromisoformat(root.turns[0].timestamp.replace("Z", "+00:00"))
-        except Exception:
-            pass
+        origin = _parse_timestamp(_turn_timeline_timestamp(root.turns[0]))
 
     rows = []
     # Lead row: the user prompt that started the session
@@ -1705,11 +1916,13 @@ def emit_trace_html(root: Session, out_path: Path):
     html_out = TRACE_HTML_HEAD
     html_out = html_out.replace("__NAME__", _esc(root.command or root.session_id[:8]))
     html_out = html_out.replace("__TOTAL_COST__", _fmt_num(root.total_cost))
+    html_out = html_out.replace("__TOTAL_TOKENS__", _fmt_num(root.total_billable_input + root.total_output))
     html_out = html_out.replace("__TOTAL_DOLLARS__", dollar_disp)
     html_out = html_out.replace("__MODEL_MIX__", _esc(model_disp))
     html_out = html_out.replace("__N_SESSIONS__", str(len(sessions)))
     html_out = html_out.replace("__N_TURNS__", str(n_turns))
     html_out = html_out.replace("__WALL__", wall_str)
+    html_out = html_out.replace("__PRICING_TABLE__", _pricing_breakdown_html(pricing_breakdown(root)))
     html_out = html_out.replace("__CLIP_BANNER__", _clip_banner_html(root))
     html_out = html_out.replace("__FINDINGS__", "")
     html_out = html_out.replace("__ROWS__", "\n".join(rows))
@@ -2051,6 +2264,7 @@ def _session_to_json(s: Session) -> dict:
 def emit_trace_json(root: Session, out_path: Path):
     sessions = list(root.all_sessions())
     total_d, total_u = root.total_dollars
+    pricing = pricing_breakdown(root)
     doc = {
         "schema_version": SCHEMA_VERSION,
         "task": {
@@ -2068,6 +2282,7 @@ def emit_trace_json(root: Session, out_path: Path):
                 "dollars": total_d,
                 "dollars_n_unpriced_turns": total_u,
                 "model_mix": root.total_model_mix,
+                "pricing": pricing,
             },
         },
         "session": _session_to_json(root),
@@ -2524,7 +2739,7 @@ def _run_rows(db_path: Path, command: str | None = None, limit: int = 20) -> lis
     if command:
         where.append("command = ?")
         args.append(command)
-    q = ("SELECT session_id, label, started_at, command, cwd, n_turns, "
+    q = ("SELECT session_id, label, started_at, command, cwd, first_prompt, wall_seconds, n_sessions, n_turns, "
          "billable_input, output_tokens, cost_weighted, dollars, model_mix, "
          "trace_dir, note FROM runs")
     if where:
@@ -2533,8 +2748,8 @@ def _run_rows(db_path: Path, command: str | None = None, limit: int = 20) -> lis
     args.append(limit)
     rows = []
     for r in conn.execute(q, args).fetchall():
-        (sid, label, started_at, cmd, cwd, turns, billable_input, output_tokens,
-         cost_weighted, dollars, model_mix, trace_dir, note) = r
+        (sid, label, started_at, cmd, cwd, first_prompt, wall_seconds, n_sessions, turns,
+         billable_input, output_tokens, cost_weighted, dollars, model_mix, trace_dir, note) = r
         try:
             mix = json.loads(model_mix or "{}")
         except Exception:
@@ -2546,6 +2761,9 @@ def _run_rows(db_path: Path, command: str | None = None, limit: int = 20) -> lis
             "started_at": started_at,
             "command": cmd,
             "cwd": cwd,
+            "first_prompt": first_prompt,
+            "wall_seconds": wall_seconds,
+            "n_sessions": n_sessions,
             "turns": turns,
             "billable_input": billable_input,
             "output_tokens": output_tokens,
@@ -3204,6 +3422,36 @@ def _session_first_command(path: Path, max_lines: int = 30) -> str:
     return ""
 
 
+def _claude_session_display_details(path: Path) -> tuple[str, float | None]:
+    prompt = ""
+    first_ts = ""
+    last_ts = ""
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                ts = r.get("timestamp", "")
+                if ts:
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                if not prompt and r.get("type") == "user":
+                    content = (r.get("message") or {}).get("content")
+                    if isinstance(content, str):
+                        prompt = content
+                    elif isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                prompt = c.get("text") or ""
+                                break
+    except Exception:
+        pass
+    return prompt, _duration_between(first_ts, last_ts)
+
+
 def _codex_session_quick(path: Path, max_lines: int = 80) -> tuple[str, str]:
     cwd = ""
     prompt = ""
@@ -3234,6 +3482,50 @@ def _codex_session_quick(path: Path, max_lines: int = 80) -> tuple[str, str]:
     except Exception:
         pass
     return cwd, prompt
+
+
+def _duration_between(first_ts: str, last_ts: str) -> float | None:
+    first = _parse_timestamp(first_ts)
+    last = _parse_timestamp(last_ts)
+    if first is None or last is None:
+        return None
+    return (last - first).total_seconds()
+
+
+def _codex_session_display_details(path: Path) -> tuple[str, float | None]:
+    prompt = ""
+    first_ts = ""
+    last_ts = ""
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                ts = r.get("timestamp", "")
+                if ts:
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                payload = r.get("payload", {}) or {}
+                if not prompt and r.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                    text = _codex_message_text(payload)
+                    if text and not _is_codex_bootstrap_user_message(text):
+                        prompt = text
+                elif not prompt and r.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    text = str(payload.get("message", ""))
+                    if text and not _is_codex_bootstrap_user_message(text):
+                        prompt = text
+    except Exception:
+        pass
+    return prompt, _duration_between(first_ts, last_ts)
+
+
+def _raw_session_display_details(path: Path, source: str) -> tuple[str, float | None]:
+    if source == "codex":
+        return _codex_session_display_details(path)
+    return _claude_session_display_details(path)
 
 
 @dataclass
@@ -3333,12 +3625,14 @@ def print_sessions_for_cwd(cwd: str, *, source: str = "auto", limit: int = 20) -
             finally:
                 conn.close()
     print(f"sessions for {cwd}:")
-    print(f"  {'when':<18}{'source':<8}{'session id':<20}{'command':<22}{'saved':<10}")
-    print("  " + "-" * 78)
+    print(f"  {'when':<18}{'source':<8}{'session id':<20}{'dur':>8} {'command':<20}{'saved':<7}prompt")
+    print("  " + "-" * 120)
     for s in matches[:limit]:
+        prompt, duration = _raw_session_display_details(s.path, s.source)
         mark = "✓" if s.session_id in seen else ""
         print(f"  {_format_mtime(s.mtime):<18}{s.source:<8}{s.session_id[:18]:<20}"
-              f"{(s.command or '—'):<22}{mark:<10}")
+              f"{_format_duration(duration):>8} {(s.command or '—')[:19]:<20}{mark:<7}"
+              f"{_one_line(prompt or s.command, 100)}")
 
 
 def tracer_version() -> str:
@@ -3553,18 +3847,28 @@ def main(argv: list[str]):
             print(f"no saved traces for project: {active_project_root(cwd, error_if_missing=False) or cwd}")
             return
         print(f"saved traces for {active_project_root(cwd)}:")
-        print(f"  {'when':<18}{'label':<22}{'turns':>5} {'tokens':>10} {'model':<13} path")
-        print("  " + "-" * 96)
+        print(f"  {'when':<18}{'label':<22}{'dur':>8} {'turns':>5} {'sess':>4} "
+              f"{'tokens':>10} {'$':>8} {'model':<13} prompt")
+        print("  " + "-" * 138)
         for row in rows:
-            summary = _summary_for_path(Path(row["trace_json"])) if row.get("trace_json") else {}
+            tokens = (row.get("billable_input") or 0) + (row.get("output_tokens") or 0)
+            dollars = row.get("dollars")
+            dollar_str = f"${dollars:.2f}" if dollars else "—"
+            prompt = row.get("first_prompt") or row.get("command") or ""
             print(
                 f"  {(row.get('started_at') or '')[:16]:<18}"
                 f"{(row.get('label') or row.get('session_id') or '')[:21]:<22}"
-                f"{summary.get('turns') or 0:>5} "
-                f"{int(summary.get('cost_weighted') or 0):>10,} "
-                f"{_shorten_model(_dominant_model(summary.get('model_mix') or {})):<13} "
-                f"{row.get('trace_json') or ''}"
+                f"{_format_duration(row.get('wall_seconds')):>8} "
+                f"{(row.get('turns') or 0):>5} "
+                f"{(row.get('n_sessions') or 0):>4} "
+                f"{int(tokens):>10,} "
+                f"{dollar_str:>8} "
+                f"{_shorten_model(_dominant_model(row.get('model_mix') or {})):<13} "
+                f"{_one_line(prompt, 100)}"
             )
+            if row.get("trace_json"):
+                print(f"  {'':<18}{'':<22}{'':>8} {'':>5} {'':>4} "
+                      f"{'':>10} {'':>8} {'':<13} {row.get('trace_json')}")
 
     elif args.cmd == "sessions":
         cwd = args.cwd or os.getcwd()
