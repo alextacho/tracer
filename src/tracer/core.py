@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -2730,7 +2730,8 @@ def _strip_tags(s: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
 
 
-def _run_rows(db_path: Path, command: str | None = None, limit: int = 20) -> list[dict]:
+def _run_rows(db_path: Path, command: str | None = None, label: str | None = None,
+              limit: int = 20) -> list[dict]:
     if not db_path.exists():
         return []
     conn = _ensure_db(db_path)
@@ -2739,6 +2740,9 @@ def _run_rows(db_path: Path, command: str | None = None, limit: int = 20) -> lis
     if command:
         where.append("command = ?")
         args.append(command)
+    if label:
+        where.append("label = ?")
+        args.append(label)
     q = ("SELECT session_id, label, started_at, command, cwd, first_prompt, wall_seconds, n_sessions, n_turns, "
          "billable_input, output_tokens, cost_weighted, dollars, model_mix, "
          "trace_dir, note FROM runs")
@@ -2784,6 +2788,20 @@ def _mcp_db_path(cwd: str | None = None, *, create: bool = False) -> Path:
         here = Path(cwd or os.getcwd()).expanduser().resolve()
         root = here if here.is_dir() else here.parent
     return project_db_path(root, create=create)
+
+
+def cmd_label(ref: str, label: str, *, cwd: str | None = None, db_override: str | None = None) -> None:
+    db_path = resolve_db(db_override, cwd_override=cwd)
+    trace_json = _resolve_run_target(ref, db_path)
+    root = load_trace_json(trace_json)
+    conn = _ensure_db(db_path)
+    row = conn.execute(
+        "SELECT note FROM runs WHERE session_id = ?",
+        (root.session_id,),
+    ).fetchone()
+    note = row[0] if row else None
+    track(root, db_path, label=label, note=note, trace_dir=trace_json.parent)
+    print(f"label set: {root.session_id} [{label}]")
 
 
 def _latest_trace_ref(db_path: Path, command: str | None = None) -> str:
@@ -3677,6 +3695,7 @@ def main(argv: list[str]):
     p_ls = sub.add_parser("ls", help="list saved traces for the current project")
     p_ls.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
     p_ls.add_argument("--limit", type=int, default=20)
+    p_ls.add_argument("--label", default=None, help="only show saved traces with this label")
 
     p_sessions = sub.add_parser("sessions", help="list raw Claude Code/Codex sessions available to save")
     p_sessions.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
@@ -3723,6 +3742,12 @@ def main(argv: list[str]):
     p_cl.add_argument("--reset", action="store_true",
                       help="clear legacy soft-clip metadata; cannot restore hard-clipped turns")
     p_cl.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
+
+    p_label = sub.add_parser("label", help="set or replace the label for an existing saved trace")
+    p_label.add_argument("ref", help="session id, current label, run dir, or trace.json path")
+    p_label.add_argument("label", help="new label")
+    p_label.add_argument("--cwd", default=None)
+    p_label.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
     p_mcp = sub.add_parser("mcp", help="serve or install the Tracer MCP server")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
@@ -3842,19 +3867,20 @@ def main(argv: list[str]):
     elif args.cmd == "ls":
         cwd = args.cwd or os.getcwd()
         db = project_db_path(active_project_root(cwd), create=False)
-        rows = _run_rows(db, limit=args.limit)
+        rows = _run_rows(db, label=args.label, limit=args.limit)
         if not rows:
-            print(f"no saved traces for project: {active_project_root(cwd, error_if_missing=False) or cwd}")
+            suffix = f" with label {args.label!r}" if args.label else ""
+            print(f"no saved traces{suffix} for project: {active_project_root(cwd, error_if_missing=False) or cwd}")
             return
-        print(f"saved traces for {active_project_root(cwd)}:")
+        label_suffix = f" [label={args.label}]" if args.label else ""
+        print(f"saved traces for {active_project_root(cwd)}{label_suffix}:")
         print(f"  {'when':<18}{'label':<22}{'dur':>8} {'turns':>5} {'sess':>4} "
-              f"{'tokens':>10} {'$':>8} {'model':<13} prompt")
-        print("  " + "-" * 138)
+              f"{'tokens':>10} {'$':>8} {'model':<13} path")
+        print("  " + "-" * 124)
         for row in rows:
             tokens = (row.get("billable_input") or 0) + (row.get("output_tokens") or 0)
             dollars = row.get("dollars")
             dollar_str = f"${dollars:.2f}" if dollars else "—"
-            prompt = row.get("first_prompt") or row.get("command") or ""
             print(
                 f"  {(row.get('started_at') or '')[:16]:<18}"
                 f"{(row.get('label') or row.get('session_id') or '')[:21]:<22}"
@@ -3864,15 +3890,15 @@ def main(argv: list[str]):
                 f"{int(tokens):>10,} "
                 f"{dollar_str:>8} "
                 f"{_shorten_model(_dominant_model(row.get('model_mix') or {})):<13} "
-                f"{_one_line(prompt, 100)}"
+                f"{row.get('trace_json') or ''}"
             )
-            if row.get("trace_json"):
-                print(f"  {'':<18}{'':<22}{'':>8} {'':>5} {'':>4} "
-                      f"{'':>10} {'':>8} {'':<13} {row.get('trace_json')}")
 
     elif args.cmd == "sessions":
         cwd = args.cwd or os.getcwd()
         print_sessions_for_cwd(cwd, source=args.source, limit=args.limit)
+
+    elif args.cmd == "label":
+        cmd_label(args.ref, args.label, cwd=args.cwd, db_override=args.db)
 
     elif args.cmd == "version":
         print(tracer_version())

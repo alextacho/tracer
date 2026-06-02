@@ -55,7 +55,7 @@ class PublicCliTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 0)
         help_text = stdout.getvalue()
-        self.assertIn("{save,ls,sessions,config,version,open,read,clip,mcp}", help_text)
+        self.assertIn("{save,ls,sessions,config,version,open,read,clip,label,mcp}", help_text)
         for command in ("track", "history", "render", "diff", "compare", "path", "init", "migrate"):
             self.assertNotIn(command, help_text)
 
@@ -96,9 +96,73 @@ class PublicCliTests(unittest.TestCase):
         self.assertIn("sample", output)
         self.assertIn("    2 ", output)
         self.assertIn("tokens", output)
-        self.assertIn("prompt", output)
-        self.assertIn("session-1234567890", output)
+        self.assertNotIn("prompt", output)
+        self.assertNotIn("session-1234567890 prompt", output)
         self.assertIn("6", output)
+
+    def test_ls_filters_by_label(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td, "project")
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            db_path = core.project_db_path(project, create=True)
+
+            first = make_session()
+            first.cwd = str(project)
+            first.session_id = "session-first"
+            first.path = Path(td, "first.jsonl")
+            first_dir = project / ".tracer" / "traces" / "first"
+            first_dir.mkdir(parents=True)
+            core.emit_trace_json(first, first_dir / "trace.json")
+            core.track(first, db_path, label="keep", trace_dir=first_dir)
+
+            second = make_session()
+            second.cwd = str(project)
+            second.session_id = "session-second"
+            second.path = Path(td, "second.jsonl")
+            second_dir = project / ".tracer" / "traces" / "second"
+            second_dir.mkdir(parents=True)
+            core.emit_trace_json(second, second_dir / "trace.json")
+            core.track(second, db_path, label="drop", trace_dir=second_dir)
+
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                core.main(["ls", "--cwd", str(project), "--label", "keep"])
+
+        output = stdout.getvalue()
+        self.assertIn("label=keep", output)
+        self.assertIn("keep", output)
+        self.assertNotIn("drop", output)
+
+    def test_label_command_updates_existing_trace_label(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td, "project")
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            session = make_session()
+            session.cwd = str(project)
+            trace_dir = project / ".tracer" / "traces" / "sample"
+            trace_dir.mkdir(parents=True)
+            core.emit_trace_json(session, trace_dir / "trace.json")
+            db_path = core.project_db_path(project, create=True)
+            core.track(session, db_path, label="old", note="keep note", trace_dir=trace_dir)
+
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                core.main([
+                    "label",
+                    session.session_id,
+                    "new",
+                    "--cwd",
+                    str(project),
+                ])
+
+            rows = core._run_rows(db_path, label="new", limit=10)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["label"], "new")
+        self.assertEqual(rows[0]["note"], "keep note")
+        self.assertIn("label set:", stdout.getvalue())
 
     def test_claude_session_display_details_are_fast_identifiers(self):
         rows = [
