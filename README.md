@@ -251,5 +251,12 @@ Use tracer to clip the latest trace from the first Edit tool call, then reopen i
 ## Notes
 
 - Tracer reads Claude Code logs from `~/.claude/projects` and Codex rollout logs from `~/.codex/sessions`.
+- To use a different Claude Code config for one project, run:
+
+  ```bash
+  tracer config set claude_config_dir ~/.claude-pk
+  ```
+
+  You can also point directly at a projects directory with `tracer config set claude_projects_dir ~/.claude-pk/projects`. The settings are stored in `.tracer/config.json`.
 - `trace.json` is the source of truth and includes full retained tool results.
 - MCP `trace_open` uses macOS `open`; in headless environments it may return the path without successfully opening the artifact.

@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -165,6 +165,123 @@ def resolve_db(db_override: str | None, *, for_session: "Session | None" = None,
         return project_db_path(session_project_root(for_session))
     root = active_project_root(cwd_override)
     return project_db_path(root)
+
+
+def project_config_path(project_root: Path) -> Path:
+    return project_tracer_dir(project_root, create=False) / TRACER_CONFIG
+
+
+def load_project_config(cwd: str | Path | None = None) -> dict:
+    root = active_project_root(str(cwd) if cwd is not None else None, error_if_missing=False)
+    if root is None:
+        return {}
+    path = project_config_path(root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        print(f"warning: failed to load project config at {path}: {e}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"warning: ignoring non-object project config at {path}", file=sys.stderr)
+        return {}
+    return data
+
+
+def save_project_config(project_root: Path, data: dict) -> Path:
+    path = project_config_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def cmd_config_get(cwd: str | None = None) -> None:
+    root = active_project_root(cwd)
+    path = project_config_path(root)
+    data = load_project_config(root)
+    print(f"{path}:")
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def cmd_config_set(key: str, value: str, cwd: str | None = None) -> None:
+    allowed = {
+        "claude_config_dir",
+        "claude_projects_dir",
+    }
+    if key not in allowed:
+        raise SystemExit(
+            f"unsupported config key: {key}\n"
+            f"supported keys: {', '.join(sorted(allowed))}"
+        )
+    root = active_project_root(cwd)
+    data = load_project_config(root)
+    data[key] = value
+    path = save_project_config(root, data)
+    print(f"set {key} = {value}")
+    print(f"updated: {path}")
+
+
+def _as_path_list(value: object) -> list[Path]:
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    paths: list[Path] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        paths.append(Path(item).expanduser())
+    return paths
+
+
+def claude_project_roots(cwd: str | Path | None = None) -> list[Path]:
+    """Claude Code project roots to search for the active Tracer project.
+
+    .tracer/config.json may specify either:
+      - claude_projects_dir / claude_projects_dirs: direct projects directory
+      - claude_config_dir / claude_config_dirs: Claude config root containing projects/
+
+    The same keys can also live under a nested "claude" object.
+    """
+    config = load_project_config(cwd)
+    claude_config = config.get("claude")
+    if not isinstance(claude_config, dict):
+        claude_config = {}
+
+    roots: list[Path] = []
+    roots.extend(_as_path_list(config.get("claude_projects_dir")))
+    roots.extend(_as_path_list(config.get("claude_projects_dirs")))
+    roots.extend(_as_path_list(claude_config.get("projects_dir")))
+    roots.extend(_as_path_list(claude_config.get("projects_dirs")))
+
+    config_dirs: list[Path] = []
+    config_dirs.extend(_as_path_list(config.get("claude_config_dir")))
+    config_dirs.extend(_as_path_list(config.get("claude_config_dirs")))
+    config_dirs.extend(_as_path_list(claude_config.get("config_dir")))
+    config_dirs.extend(_as_path_list(claude_config.get("config_dirs")))
+    roots.extend(d / "projects" for d in config_dirs)
+
+    if not roots:
+        roots = [CLAUDE_PROJECTS]
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = os.path.realpath(os.path.expanduser(str(root)))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return deduped
+
+
+def session_search_roots(source: str = "auto", cwd: str | Path | None = None) -> list[Path]:
+    roots: list[Path] = []
+    if source in ("auto", "claude"):
+        roots.extend(claude_project_roots(cwd))
+    if source in ("auto", "codex"):
+        roots.append(CODEX_SESSIONS)
+    return roots
 
 
 # Cost weights — roughly track Anthropic API pricing ratios.
@@ -932,17 +1049,13 @@ def parse_codex_session(path: Path) -> Session:
     )
 
 
-def resolve_input(arg: str, source: str = "auto") -> Path:
+def resolve_input(arg: str, source: str = "auto", cwd: str | Path | None = None) -> Path:
     """Accept a file path, a full session id, or an 8-char (or longer) prefix.
-    Searches ~/.claude/projects."""
+    Searches configured Claude/Codex session roots."""
     p = Path(arg).expanduser()
     if p.is_file():
         return p
-    roots = []
-    if source in ("auto", "claude"):
-        roots.append(CLAUDE_PROJECTS)
-    if source in ("auto", "codex"):
-        roots.append(CODEX_SESSIONS)
+    roots = session_search_roots(source, cwd)
     candidates = []
     for root in roots:
         if not root.is_dir():
@@ -2591,7 +2704,7 @@ def mcp_trace_create(
     emit_ascii_artifact: bool = False,
 ) -> dict:
     if session:
-        path = resolve_input(session, source=source)
+        path = resolve_input(session, source=source, cwd=cwd or os.getcwd())
     else:
         cwd_for_lookup = cwd or os.getcwd()
         matches = find_sessions_for_cwd(cwd_for_lookup, source=source)
@@ -3028,17 +3141,18 @@ def cmd_mcp_remove(scope: str | None, name: str):
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _iter_claude_session_files() -> Iterable[Path]:
+def _iter_claude_session_files(cwd: str | Path | None = None) -> Iterable[Path]:
     """Yield every top-level session JSONL across all Claude Code projects."""
-    if not CLAUDE_PROJECTS.is_dir():
-        return
-    for proj in CLAUDE_PROJECTS.iterdir():
-        if not proj.is_dir():
+    for root in claude_project_roots(cwd):
+        if not root.is_dir():
             continue
-        for f in proj.glob("*.jsonl"):
-            if "subagents" in f.parts:
+        for proj in root.iterdir():
+            if not proj.is_dir():
                 continue
-            yield f
+            for f in proj.glob("*.jsonl"):
+                if "subagents" in f.parts:
+                    continue
+                yield f
 
 
 def _iter_codex_session_files() -> Iterable[Path]:
@@ -3048,9 +3162,9 @@ def _iter_codex_session_files() -> Iterable[Path]:
     yield from CODEX_SESSIONS.rglob("rollout-*.jsonl")
 
 
-def _iter_session_files(source: str = "auto") -> Iterable[tuple[str, Path]]:
+def _iter_session_files(source: str = "auto", cwd: str | Path | None = None) -> Iterable[tuple[str, Path]]:
     if source in ("auto", "claude"):
-        for f in _iter_claude_session_files():
+        for f in _iter_claude_session_files(cwd):
             yield ("claude", f)
     if source in ("auto", "codex"):
         for f in _iter_codex_session_files():
@@ -3136,7 +3250,7 @@ def find_sessions_for_cwd(cwd: str, source: str = "auto") -> list[SessionSummary
     """Return sessions whose recorded cwd matches `cwd`, sorted newest-first."""
     cwd_n = os.path.realpath(os.path.expanduser(cwd)).rstrip("/")
     results: list[SessionSummary] = []
-    for src, f in _iter_session_files(source):
+    for src, f in _iter_session_files(source, cwd):
         if src == "codex":
             sc, command = _codex_session_quick(f)
             sid = f.stem.rsplit("-", 5)
@@ -3275,6 +3389,15 @@ def main(argv: list[str]):
     p_sessions.add_argument("--source", default="auto", choices=["auto", "claude", "codex"])
     p_sessions.add_argument("--limit", type=int, default=20)
 
+    p_config = sub.add_parser("config", help="read or update current project's Tracer settings")
+    config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+    p_config_get = config_sub.add_parser("get", help="print current project's Tracer config")
+    p_config_get.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
+    p_config_set = config_sub.add_parser("set", help="set one project config value")
+    p_config_set.add_argument("key", choices=["claude_config_dir", "claude_projects_dir"])
+    p_config_set.add_argument("value")
+    p_config_set.add_argument("--cwd", default=None, help="override cwd (default: $PWD)")
+
     sub.add_parser("version", help="print tracer version")
 
     p_op = sub.add_parser("open", help="open a saved trace run (ref or current cwd's latest)")
@@ -3331,16 +3454,23 @@ def main(argv: list[str]):
         elif args.mcp_cmd == "remove":
             cmd_mcp_remove(args.scope, args.name)
 
+    elif args.cmd == "config":
+        if args.config_cmd == "get":
+            cmd_config_get(args.cwd)
+        elif args.config_cmd == "set":
+            cmd_config_set(args.key, args.value, args.cwd)
+
     elif args.cmd == "save":
+        cwd = os.getcwd()
         if args.session:
-            path = resolve_input(args.session, source=args.source)
+            path = resolve_input(args.session, source=args.source, cwd=cwd)
         else:
-            cwd = os.getcwd()
             matches = find_sessions_for_cwd(cwd, source=args.source)
             if not matches:
+                roots = session_search_roots(args.source, cwd)
                 raise SystemExit(
                     f"no sessions found for cwd: {cwd}\n"
-                    f"(walked {CLAUDE_PROJECTS} and {CODEX_SESSIONS})"
+                    f"(walked {', '.join(str(r) for r in roots)})"
                 )
             path = matches[0].path
             print(f"latest {matches[0].source} session for {cwd}: {matches[0].session_id} "

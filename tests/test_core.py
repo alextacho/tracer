@@ -55,7 +55,7 @@ class PublicCliTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 0)
         help_text = stdout.getvalue()
-        self.assertIn("{save,ls,sessions,version,open,read,clip,mcp}", help_text)
+        self.assertIn("{save,ls,sessions,config,version,open,read,clip,mcp}", help_text)
         for command in ("track", "history", "render", "diff", "compare", "path", "init", "migrate"):
             self.assertNotIn(command, help_text)
 
@@ -94,6 +94,29 @@ class PublicCliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("sample", output)
         self.assertIn("    2 ", output)
+
+    def test_config_set_writes_project_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td, "project")
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                core.main([
+                    "config",
+                    "set",
+                    "claude_config_dir",
+                    "~/.claude-pk",
+                    "--cwd",
+                    str(project),
+                ])
+
+            config_path = project / ".tracer" / "config.json"
+            data = json.loads(config_path.read_text())
+
+        self.assertEqual(data["claude_config_dir"], "~/.claude-pk")
+        self.assertIn("updated:", stdout.getvalue())
 
 
 class InitRootTests(unittest.TestCase):
@@ -165,6 +188,54 @@ class InitRootTests(unittest.TestCase):
 
             self.assertTrue((project / ".tracer" / "traces").is_dir())
             self.assertFalse((home / ".tracer" / "traces").exists())
+
+
+class SessionDiscoveryTests(unittest.TestCase):
+    def test_project_config_can_override_claude_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            (project / ".tracer").mkdir()
+            (project / ".tracer" / "config.json").write_text(json.dumps({
+                "claude_config_dir": str(root / ".claude-pk")
+            }))
+
+            custom_projects = root / ".claude-pk" / "projects" / "encoded-project"
+            custom_projects.mkdir(parents=True)
+            session_path = custom_projects / "session-pk.jsonl"
+            session_path.write_text(json.dumps({
+                "type": "user",
+                "cwd": str(project),
+                "message": {"content": "hello"},
+            }) + "\n")
+
+            matches = core.find_sessions_for_cwd(str(project), source="claude")
+
+        self.assertEqual([m.path for m in matches], [session_path])
+        self.assertEqual(matches[0].session_id, "session-pk")
+
+    def test_resolve_input_uses_project_claude_projects_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            (project / ".tracer").mkdir()
+
+            custom_root = root / "claude-projects"
+            session_dir = custom_root / "encoded-project"
+            session_dir.mkdir(parents=True)
+            session_path = session_dir / "session-custom.jsonl"
+            session_path.write_text("{}\n")
+            (project / ".tracer" / "config.json").write_text(json.dumps({
+                "claude_projects_dir": str(custom_root)
+            }))
+
+            resolved = core.resolve_input("session-custom", source="claude", cwd=project)
+
+        self.assertEqual(resolved, session_path)
 
 
 class TraceJsonTests(unittest.TestCase):
