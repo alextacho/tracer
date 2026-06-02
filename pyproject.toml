@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tracer"
-version = "0.1.6"
+version = "0.1.7"
 description = "Create, review, and compare coding-agent trace artifacts through a CLI, local Lab, and MCP server."
 readme = "README.md"
 requires-python = ">=3.10"

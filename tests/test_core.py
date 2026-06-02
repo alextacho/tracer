@@ -55,8 +55,8 @@ class PublicCliTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 0)
         help_text = stdout.getvalue()
-        self.assertIn("{save,ls,sessions,config,version,open,read,clip,label,mcp}", help_text)
-        for command in ("track", "history", "render", "diff", "compare", "path", "init", "migrate"):
+        self.assertIn("{save,ls,sessions,config,version,open,read,path,clip,label,mcp}", help_text)
+        for command in ("track", "history", "render", "diff", "compare", "init", "migrate"):
             self.assertNotIn(command, help_text)
 
     def test_ls_sessions_option_is_not_supported(self):
@@ -94,11 +94,37 @@ class PublicCliTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("sample", output)
+        self.assertIn("ref", output)
+        self.assertIn(session.session_id[:8], output)
         self.assertIn("    2 ", output)
         self.assertIn("tokens", output)
         self.assertNotIn("prompt", output)
         self.assertNotIn("session-1234567890 prompt", output)
+        self.assertNotIn(str(trace_dir / "trace.json"), output)
         self.assertIn("6", output)
+
+    def test_path_command_prints_artifact_path_for_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td, "project")
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            session = make_session()
+            session.cwd = str(project)
+            trace_dir = project / ".tracer" / "traces" / "sample"
+            trace_dir.mkdir(parents=True)
+            core.emit_trace_json(session, trace_dir / "trace.json")
+            core.emit_trace_html(session, trace_dir / "trace.html")
+            db_path = core.project_db_path(project, create=True)
+            core.track(session, db_path, label="sample", trace_dir=trace_dir)
+
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                core.main(["path", session.session_id[:8], "--cwd", str(project), "--view", "json"])
+
+        self.assertEqual(
+            os.path.realpath(stdout.getvalue().strip()),
+            os.path.realpath(trace_dir / "trace.json"),
+        )
 
     def test_ls_filters_by_label(self):
         with tempfile.TemporaryDirectory() as td:

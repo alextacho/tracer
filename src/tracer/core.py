@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -3730,6 +3730,14 @@ def main(argv: list[str]):
     p_rd.add_argument("--summary", action="store_true", help="print a compact summary instead of full trace.json")
     p_rd.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
+    p_path = sub.add_parser("path", help="print the filesystem path for a saved trace ref")
+    p_path.add_argument("ref", help="session id, label, run dir, or trace.json path")
+    p_path.add_argument("--cwd", default=None)
+    p_path.add_argument("--view", default="trace",
+                        choices=["trace", "json", "dir"],
+                        help="which artifact path to print")
+    p_path.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
+
     p_cl = sub.add_parser("clip", help="hard clip an existing trace.json")
     p_cl.add_argument("ref", help="run reference (session id, label, or path)")
     p_cl.add_argument("--start", type=int, default=None,
@@ -3874,28 +3882,37 @@ def main(argv: list[str]):
             return
         label_suffix = f" [label={args.label}]" if args.label else ""
         print(f"saved traces for {active_project_root(cwd)}{label_suffix}:")
-        print(f"  {'when':<18}{'label':<22}{'dur':>8} {'turns':>5} {'sess':>4} "
-              f"{'tokens':>10} {'$':>8} {'model':<13} path")
-        print("  " + "-" * 124)
+        print(f"  {'ref':<10}{'when':<18}{'label':<22}{'dur':>8} {'turns':>5} {'sess':>4} "
+              f"{'tokens':>10} {'$':>8} {'model':<13}")
+        print("  " + "-" * 86)
         for row in rows:
             tokens = (row.get("billable_input") or 0) + (row.get("output_tokens") or 0)
             dollars = row.get("dollars")
             dollar_str = f"${dollars:.2f}" if dollars else "—"
             print(
-                f"  {(row.get('started_at') or '')[:16]:<18}"
+                f"  {(row.get('ref') or ''):<10}"
+                f"{(row.get('started_at') or '')[:16]:<18}"
                 f"{(row.get('label') or row.get('session_id') or '')[:21]:<22}"
                 f"{_format_duration(row.get('wall_seconds')):>8} "
                 f"{(row.get('turns') or 0):>5} "
                 f"{(row.get('n_sessions') or 0):>4} "
                 f"{int(tokens):>10,} "
                 f"{dollar_str:>8} "
-                f"{_shorten_model(_dominant_model(row.get('model_mix') or {})):<13} "
-                f"{row.get('trace_json') or ''}"
+                f"{_shorten_model(_dominant_model(row.get('model_mix') or {})):<13}"
             )
 
     elif args.cmd == "sessions":
         cwd = args.cwd or os.getcwd()
         print_sessions_for_cwd(cwd, source=args.source, limit=args.limit)
+
+    elif args.cmd == "path":
+        tj = _resolve_run_target(args.ref, resolve_db(args.db, cwd_override=args.cwd))
+        target_map = {
+            "trace": tj.parent / "trace.html",
+            "json": tj,
+            "dir": tj.parent,
+        }
+        print(target_map[args.view])
 
     elif args.cmd == "label":
         cmd_label(args.ref, args.label, cwd=args.cwd, db_override=args.db)
