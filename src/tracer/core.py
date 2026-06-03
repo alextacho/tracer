@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -1123,6 +1123,13 @@ def _fmt_num(n: float | int) -> str:
     return f"{n:,.0f}" if isinstance(n, float) else f"{n:,}"
 
 
+def _money_short(dollars: float, unpriced_turns: int = 0) -> str:
+    text = f"${dollars:,.2f}" if dollars else "—"
+    if unpriced_turns:
+        text += f" ({unpriced_turns} unpriced)"
+    return text
+
+
 def _build_hints(root: Session) -> str:
     """Surface a handful of likely-actionable optimization findings."""
     hints: list[str] = []
@@ -1444,6 +1451,7 @@ TRACE_HTML_HEAD = r"""<!DOCTYPE html>
   <span><b>tokens:</b> <span class="num">__TOTAL_TOKENS__</span></span>
   <span><b>dollars:</b> <span class="num">__TOTAL_DOLLARS__</span></span>
   <span><b>model:</b> <span class="num">__MODEL_MIX__</span></span>
+  __NOTE__
   <span><b>sessions:</b> __N_SESSIONS__</span>
   <span><b>turns:</b> __N_TURNS__</span>
   <span><b>wall:</b> __WALL__</span>
@@ -1776,7 +1784,8 @@ def _trace_rows(sess: Session, depth: int, origin: datetime | None) -> list[str]
                     + (f'<details><summary>spawn prompt</summary>'
                        f'<pre>{_input_pretty("Agent", tc.input_full)}</pre></details>'
                        if tc.input_full else ""),
-                    f"{sub.total_cost:,.0f} cost · {len(sub.turns)} turns",
+                    f"{_short_num(sub.total_cost)} cost · "
+                    f"{_money_short(*sub.total_dollars)} · {len(sub.turns)} turns",
                     depth,
                     "t-agent" + clip_class,
                 ))
@@ -1868,7 +1877,7 @@ def _clip_banner_html(root: Session) -> str:
     return ('<div class="clip-banner">' + " — ".join(bits) + "</div>")
 
 
-def emit_trace_html(root: Session, out_path: Path):
+def emit_trace_html(root: Session, out_path: Path, note: str | None = None):
     # Origin = earliest event timestamp in the first root turn.
     origin = None
     if root.turns:
@@ -1922,6 +1931,10 @@ def emit_trace_html(root: Session, out_path: Path):
     html_out = html_out.replace("__N_SESSIONS__", str(len(sessions)))
     html_out = html_out.replace("__N_TURNS__", str(n_turns))
     html_out = html_out.replace("__WALL__", wall_str)
+    html_out = html_out.replace(
+        "__NOTE__",
+        f'<span><b>note:</b> <span class="num">{_esc(note)}</span></span>' if note else "",
+    )
     html_out = html_out.replace("__PRICING_TABLE__", _pricing_breakdown_html(pricing_breakdown(root)))
     html_out = html_out.replace("__CLIP_BANNER__", _clip_banner_html(root))
     html_out = html_out.replace("__FINDINGS__", "")
@@ -2199,7 +2212,9 @@ def _event_to_json(e: Event) -> dict:
             },
         }
         if e.child_session is not None:
-            d["child_session"] = _session_to_json(e.child_session)
+            child_json = _session_to_json(e.child_session)
+            d["child_session"] = child_json
+            d["child_session_summary"] = child_json["totals"]
         return d
     raise TypeError(f"unknown event type: {type(e)!r}")
 
@@ -2261,7 +2276,7 @@ def _session_to_json(s: Session) -> dict:
     }
 
 
-def emit_trace_json(root: Session, out_path: Path):
+def emit_trace_json(root: Session, out_path: Path, note: str | None = None):
     sessions = list(root.all_sessions())
     total_d, total_u = root.total_dollars
     pricing = pricing_breakdown(root)
@@ -2273,6 +2288,7 @@ def emit_trace_json(root: Session, out_path: Path):
             "started_at": root.turns[0].timestamp if root.turns else "",
             "wall_seconds": root.wall_seconds,
             "first_user_prompt": root.first_user_prompt,
+            "note": note,
             "totals": {
                 "sessions": len(sessions),
                 "turns": sum(len(s.turns) for s in sessions),
@@ -2955,8 +2971,8 @@ def mcp_trace_create(
     out_dir.mkdir(parents=True, exist_ok=True)
     trace_json = out_dir / "trace.json"
     trace_html = out_dir / "trace.html"
-    emit_trace_json(root, trace_json)
-    emit_trace_html(root, trace_html)
+    emit_trace_json(root, trace_json, note=note)
+    emit_trace_html(root, trace_html, note=note)
     ascii_path = None
     if emit_ascii_artifact:
         ascii_path = out_dir / "ascii.txt"
@@ -3882,17 +3898,19 @@ def main(argv: list[str]):
             return
         label_suffix = f" [label={args.label}]" if args.label else ""
         print(f"saved traces for {active_project_root(cwd)}{label_suffix}:")
-        print(f"  {'ref':<10}{'when':<18}{'label':<22}{'dur':>8} {'turns':>5} {'sess':>4} "
+        print(f"  {'ref':<10}{'when':<18}{'label':<22}{'note':<24}{'dur':>8} {'turns':>5} {'sess':>4} "
               f"{'tokens':>10} {'$':>8} {'model':<13}")
-        print("  " + "-" * 86)
+        print("  " + "-" * 110)
         for row in rows:
             tokens = (row.get("billable_input") or 0) + (row.get("output_tokens") or 0)
             dollars = row.get("dollars")
             dollar_str = f"${dollars:.2f}" if dollars else "—"
+            note = _one_line(row.get("note") or "", 24) or "—"
             print(
                 f"  {(row.get('ref') or ''):<10}"
                 f"{(row.get('started_at') or '')[:16]:<18}"
                 f"{(row.get('label') or row.get('session_id') or '')[:21]:<22}"
+                f"{note:<24}"
                 f"{_format_duration(row.get('wall_seconds')):>8} "
                 f"{(row.get('turns') or 0):>5} "
                 f"{(row.get('n_sessions') or 0):>4} "
@@ -3960,9 +3978,9 @@ def main(argv: list[str]):
             if row:
                 prev_label, prev_note = row
         # Re-emit JSON + re-render views in place.
-        emit_trace_json(root, tj)
+        emit_trace_json(root, tj, note=prev_note)
         out_dir = tj.parent
-        emit_trace_html(root, out_dir / "trace.html")
+        emit_trace_html(root, out_dir / "trace.html", note=prev_note)
         track(root, db_path, label=prev_label, note=prev_note, trace_dir=out_dir)
         print(f"re-rendered views in {out_dir}")
 

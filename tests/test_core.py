@@ -140,7 +140,7 @@ class PublicCliTests(unittest.TestCase):
             first_dir = project / ".tracer" / "traces" / "first"
             first_dir.mkdir(parents=True)
             core.emit_trace_json(first, first_dir / "trace.json")
-            core.track(first, db_path, label="keep", trace_dir=first_dir)
+            core.track(first, db_path, label="keep", note="keep note", trace_dir=first_dir)
 
             second = make_session()
             second.cwd = str(project)
@@ -149,7 +149,7 @@ class PublicCliTests(unittest.TestCase):
             second_dir = project / ".tracer" / "traces" / "second"
             second_dir.mkdir(parents=True)
             core.emit_trace_json(second, second_dir / "trace.json")
-            core.track(second, db_path, label="drop", trace_dir=second_dir)
+            core.track(second, db_path, label="drop", note="drop note", trace_dir=second_dir)
 
             stdout = io.StringIO()
             with patch("sys.stdout", stdout):
@@ -158,6 +158,7 @@ class PublicCliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("label=keep", output)
         self.assertIn("keep", output)
+        self.assertIn("keep note", output)
         self.assertNotIn("drop", output)
 
     def test_label_command_updates_existing_trace_label(self):
@@ -414,9 +415,10 @@ class CostDisplayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             trace_json = Path(td, "trace.json")
-            core.emit_trace_json(session, trace_json)
+            core.emit_trace_json(session, trace_json, note="release note")
             doc = json.loads(trace_json.read_text())
 
+        self.assertEqual(doc["task"]["note"], "release note")
         pricing = doc["task"]["totals"]["pricing"]
         self.assertEqual(pricing["rows"][0]["model"], "claude-opus-4-8")
         self.assertEqual(pricing["rows"][0]["label"], "Opus 4.8")
@@ -437,15 +439,67 @@ class CostDisplayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             trace_html = Path(td, "trace.html")
-            core.emit_trace_html(session, trace_html)
+            core.emit_trace_html(session, trace_html, note="release note")
             html = trace_html.read_text()
 
         self.assertIn('class="pricing-table"', html)
+        self.assertIn("<b>note:</b>", html)
+        self.assertIn("release note", html)
         self.assertIn("<th>Model</th><th>Input</th><th>Output</th>", html)
         self.assertIn("Opus 4.8", html)
         self.assertIn("52,685", html)
         self.assertIn("417,664", html)
         self.assertIn("$13.27", html)
+
+    def test_subagent_cost_is_exported_in_html_and_json(self):
+        session = make_session()
+        session.turns[0].model = "claude-opus-4-8"
+        session.turns[0].input_tokens = 100_000
+        session.turns[0].cache_creation = 50_000
+        session.turns[0].cache_read = 25_000
+        session.turns[0].output_tokens = 10_000
+
+        child_turn = core.Turn(
+            request_id="child-req",
+            timestamp="2026-05-19T10:00:01Z",
+            input_tokens=100_000,
+            cache_creation=50_000,
+            cache_read=25_000,
+            output_tokens=10_000,
+            model="claude-opus-4-8",
+        )
+        child_session = core.Session(
+            path=Path("/tmp/child.jsonl"),
+            session_id="child-session",
+            agent_type="general-purpose",
+            command=None,
+            first_user_prompt="child prompt",
+            cwd="/tmp",
+            turns=[child_turn],
+        )
+        session.turns[0].events.append(core.ToolCall(
+            name="Agent",
+            input_label="child",
+            result_tokens=10,
+            tool_use_id="toolu-1",
+            input_full={"description": "child", "subagent_type": "general-purpose"},
+            child_session=child_session,
+        ))
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_json = Path(td, "trace.json")
+            trace_html = Path(td, "trace.html")
+            core.emit_trace_json(session, trace_json)
+            core.emit_trace_html(session, trace_html)
+            doc = json.loads(trace_json.read_text())
+            html = trace_html.read_text()
+
+        child_summary = doc["session"]["turns"][0]["events"][0]["child_session_summary"]
+        self.assertEqual(child_summary["turns"], 1)
+        self.assertAlmostEqual(child_summary["total_dollars"], 3.225, places=3)
+        self.assertIn("▶ Agent", html)
+        self.assertIn("$3.23", html)
+        self.assertIn("cost", html)
 
 
 class TraceJsonTests(unittest.TestCase):
