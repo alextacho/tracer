@@ -55,7 +55,7 @@ class PublicCliTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 0)
         help_text = stdout.getvalue()
-        self.assertIn("{save,ls,sessions,config,version,open,read,path,clip,label,mcp}", help_text)
+        self.assertIn("{save,ls,sessions,config,version,open,read,path,clip,label,note,mcp}", help_text)
         for command in ("track", "history", "render", "diff", "compare", "init", "migrate"):
             self.assertNotIn(command, help_text)
 
@@ -189,7 +189,42 @@ class PublicCliTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["label"], "new")
         self.assertEqual(rows[0]["note"], "keep note")
-        self.assertIn("label set:", stdout.getvalue())
+
+    def test_note_command_updates_existing_trace_note(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td, "project")
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+            session = make_session()
+            session.cwd = str(project)
+            trace_dir = project / ".tracer" / "traces" / "sample"
+            trace_dir.mkdir(parents=True)
+            core.emit_trace_json(session, trace_dir / "trace.json", note="old note")
+            core.emit_trace_html(session, trace_dir / "trace.html", note="old note")
+            db_path = core.project_db_path(project, create=True)
+            core.track(session, db_path, label="old", note="old note", trace_dir=trace_dir)
+
+            stdout = io.StringIO()
+            with patch("sys.stdout", stdout):
+                core.main([
+                    "note",
+                    session.session_id,
+                    "new",
+                    "note",
+                    "text",
+                    "--cwd",
+                    str(project),
+                ])
+
+            rows = core._run_rows(db_path, label="old", limit=10)
+            trace_json = json.loads((trace_dir / "trace.json").read_text())
+            trace_html = (trace_dir / "trace.html").read_text()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["note"], "new note text")
+        self.assertEqual(trace_json["task"]["note"], "new note text")
+        self.assertIn("new note text", trace_html)
+        self.assertIn("note set:", stdout.getvalue())
 
     def test_claude_session_display_details_are_fast_identifiers(self):
         rows = [

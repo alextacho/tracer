@@ -28,7 +28,7 @@ from typing import Iterable
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # Legacy central store retained for internal migration helpers.
 LEGACY_TRACER_DB_ROOT = Path(
@@ -2820,6 +2820,23 @@ def cmd_label(ref: str, label: str, *, cwd: str | None = None, db_override: str 
     print(f"label set: {root.session_id} [{label}]")
 
 
+def cmd_note(ref: str, note: str, *, cwd: str | None = None, db_override: str | None = None) -> None:
+    db_path = resolve_db(db_override, cwd_override=cwd)
+    trace_json = _resolve_run_target(ref, db_path)
+    root = load_trace_json(trace_json)
+    conn = _ensure_db(db_path)
+    row = conn.execute(
+        "SELECT label FROM runs WHERE session_id = ?",
+        (root.session_id,),
+    ).fetchone()
+    label = row[0] if row else None
+    trace_dir = trace_json.parent
+    emit_trace_json(root, trace_json, note=note)
+    emit_trace_html(root, trace_dir / "trace.html", note=note)
+    track(root, db_path, label=label, note=note, trace_dir=trace_dir)
+    print(f"note set: {root.session_id} [{note}]")
+
+
 def _latest_trace_ref(db_path: Path, command: str | None = None) -> str:
     rows = _run_rows(db_path, command=command, limit=1)
     if not rows:
@@ -3773,6 +3790,12 @@ def main(argv: list[str]):
     p_label.add_argument("--cwd", default=None)
     p_label.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
 
+    p_note = sub.add_parser("note", help="set or replace the note for an existing saved trace")
+    p_note.add_argument("ref", help="session id, current label, run dir, or trace.json path")
+    p_note.add_argument("note", nargs="+", help="new note text")
+    p_note.add_argument("--cwd", default=None)
+    p_note.add_argument("--db", default=None, help="path to SQLite db (default: current project's .tracer/runs.db)")
+
     p_mcp = sub.add_parser("mcp", help="serve or install the Tracer MCP server")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
     mcp_sub.add_parser("serve", help="run the stdio MCP server")
@@ -3934,6 +3957,9 @@ def main(argv: list[str]):
 
     elif args.cmd == "label":
         cmd_label(args.ref, args.label, cwd=args.cwd, db_override=args.db)
+
+    elif args.cmd == "note":
+        cmd_note(args.ref, " ".join(args.note), cwd=args.cwd, db_override=args.db)
 
     elif args.cmd == "version":
         print(tracer_version())
